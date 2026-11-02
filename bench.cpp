@@ -130,6 +130,7 @@ int main(int argc, char** argv) {
     for (size_t i = kWarmup; i < n; ++i) ++counts[size_t(ops[i].type)];
     for (int k = 0; k < 4; ++k) lat[k].reserve(counts[k]);
 
+    uint64_t checksum = 1469598103934665603ull;
     OrderBook book2;
     for (size_t i = 0; i < kWarmup; ++i) apply(book2, ops[i], trades);
     trades.clear();
@@ -139,8 +140,13 @@ int main(int argc, char** argv) {
         auto b = Clock::now();
         lat[size_t(ops[i].type)].push_back(
             uint32_t(std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count()));
+        for (const Trade& tr : trades)  // FNV-1a over every trade, outside the timed bracket
+            for (uint64_t v : {tr.buy_id, tr.sell_id, uint64_t(tr.price), tr.qty})
+                checksum = (checksum ^ v) * 1099511628211ull;
         trades.clear();
     }
+    // Must not change across optimizations: same ops in, same trades out.
+    std::printf("trade checksum %016llx\n", (unsigned long long)checksum);
 
     std::printf("latency ns %10s %8s %8s %8s %8s %8s %10s\n", "count", "p50", "p90", "p99", "p99.9",
                 "p99.99", "max");
