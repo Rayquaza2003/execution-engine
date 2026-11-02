@@ -3,7 +3,6 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
-#include <list>
 #include <map>
 #include <optional>
 #include <unordered_map>
@@ -15,13 +14,6 @@ using Qty = uint64_t;
 
 enum class Side : uint8_t { Buy, Sell };
 
-struct Order {
-    OrderId id;
-    Side side;
-    Price price;
-    Qty qty;
-};
-
 struct Trade {
     OrderId buy_id;
     OrderId sell_id;
@@ -30,9 +22,13 @@ struct Trade {
 };
 
 // Price-time priority: levels sorted by price, FIFO within a level.
-// ponytail: std::map + std::list, node allocations on every insert; flat price ladder + pool in Phase 3.
+// Orders live in a pool (vector + free list) and link to each other by index,
+// so resting an order allocates nothing once the pool has warmed up.
+// ponytail: std::map levels still allocate per new price; flat ladder next.
 class OrderBook {
 public:
+    explicit OrderBook(size_t capacity = 1 << 16) { pool_.reserve(capacity); }
+
     // Returns false (rejected, book untouched) on zero qty or a live duplicate id.
     bool limit(OrderId id, Side side, Price px, Qty qty, std::vector<Trade>& out) {
         if (qty == 0 || index_.contains(id)) return false;
@@ -55,9 +51,9 @@ public:
     bool cancel(OrderId id) {
         auto it = index_.find(id);
         if (it == index_.end()) return false;
-        Level::iterator o = it->second;
-        if (o->side == Side::Buy) unlink(bids_, o);
-        else unlink(asks_, o);
+        uint32_t o = it->second;
+        if (pool_[o].side == Side::Buy) remove(bids_, o);
+        else remove(asks_, o);
         index_.erase(it);
         return true;
     }
@@ -67,7 +63,7 @@ public:
     bool modify(OrderId id, Price px, Qty qty, std::vector<Trade>& out) {
         auto it = index_.find(id);
         if (it == index_.end() || qty == 0) return false;
-        Side side = it->second->side;
+        Side side = pool_[it->second].side;
         cancel(id);
         return limit(id, side, px, qty, out);
     }
@@ -82,7 +78,19 @@ public:
     size_t order_count() const { return index_.size(); }
 
 private:
-    using Level = std::list<Order>;
+    static constexpr uint32_t kNil = std::numeric_limits<uint32_t>::max();
+
+    struct Order {
+        OrderId id;
+        Price price;
+        Qty qty;
+        uint32_t prev, next;  // pool indices within the price level
+        Side side;
+    };
+
+    struct Level {
+        uint32_t head = kNil, tail = kNil;
+    };
 
     // Fill against the opposite side while it crosses px. Trades print at the
     // resting order's price. Returns the unfilled quantity.
@@ -92,8 +100,9 @@ private:
             auto lvl = levels.begin();
             if (side == Side::Buy ? lvl->first > px : lvl->first < px) break;
             Level& q = lvl->second;
-            while (qty && !q.empty()) {
-                Order& resting = q.front();
+            while (qty && q.head != kNil) {
+                uint32_t h = q.head;
+                Order& resting = pool_[h];
                 Qty n = std::min(qty, resting.qty);
                 out.push_back(side == Side::Buy ? Trade{id, resting.id, resting.price, n}
                                                 : Trade{resting.id, id, resting.price, n});
@@ -101,26 +110,47 @@ private:
                 resting.qty -= n;
                 if (resting.qty == 0) {
                     index_.erase(resting.id);
-                    q.pop_front();
+                    unlink(q, h);
+                    free_.push_back(h);
                 }
             }
-            if (q.empty()) levels.erase(lvl);
+            if (q.head == kNil) levels.erase(lvl);
         }
         return qty;
     }
 
     template <class Levels>
     void rest(Levels& levels, OrderId id, Side side, Price px, Qty qty) {
+        uint32_t o;
+        if (free_.empty()) {
+            o = uint32_t(pool_.size());
+            pool_.push_back({});  // ponytail: vector growth copies the pool; size capacity up front
+        } else {
+            o = free_.back();
+            free_.pop_back();
+        }
         Level& q = levels[px];
-        q.push_back({id, side, px, qty});
-        index_[id] = std::prev(q.end());
+        pool_[o] = {id, px, qty, q.tail, kNil, side};
+        if (q.tail != kNil) pool_[q.tail].next = o;
+        else q.head = o;
+        q.tail = o;
+        index_[id] = o;
+    }
+
+    void unlink(Level& q, uint32_t o) {
+        Order& x = pool_[o];
+        if (x.prev != kNil) pool_[x.prev].next = x.next;
+        else q.head = x.next;
+        if (x.next != kNil) pool_[x.next].prev = x.prev;
+        else q.tail = x.prev;
     }
 
     template <class Levels>
-    static void unlink(Levels& levels, Level::iterator o) {
-        auto lvl = levels.find(o->price);
-        lvl->second.erase(o);
-        if (lvl->second.empty()) levels.erase(lvl);
+    void remove(Levels& levels, uint32_t o) {
+        auto lvl = levels.find(pool_[o].price);
+        unlink(lvl->second, o);
+        free_.push_back(o);
+        if (lvl->second.head == kNil) levels.erase(lvl);
     }
 
     template <class Levels>
@@ -130,15 +160,17 @@ private:
     }
 
     template <class Levels>
-    static Qty level_qty(const Levels& levels, Price px) {
+    Qty level_qty(const Levels& levels, Price px) const {
         auto lvl = levels.find(px);
         if (lvl == levels.end()) return 0;
         Qty total = 0;
-        for (const Order& o : lvl->second) total += o.qty;
+        for (uint32_t o = lvl->second.head; o != kNil; o = pool_[o].next) total += pool_[o].qty;
         return total;
     }
 
+    std::vector<Order> pool_;
+    std::vector<uint32_t> free_;
     std::map<Price, Level, std::greater<Price>> bids_;  // best (highest) first
     std::map<Price, Level> asks_;                        // best (lowest) first
-    std::unordered_map<OrderId, Level::iterator> index_;
+    std::unordered_map<OrderId, uint32_t> index_;
 };
