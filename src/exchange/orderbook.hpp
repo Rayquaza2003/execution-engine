@@ -15,6 +15,19 @@ struct Trade {
     Qty qty;
 };
 
+struct OrderResult {
+    enum Status : uint8_t {
+        Rejected,   // book untouched; see reason
+        Rested,     // some or none filled, remainder rests on the book
+        Filled,     // fully executed
+        Cancelled,  // remainder dropped without resting (market order)
+    };
+    Status status;
+    Reject reason = Reject::None;
+    Qty filled = 0;  // quantity executed by this call
+    explicit operator bool() const { return status != Rejected; }
+};
+
 // Price-time priority: one flat array of price levels per side, FIFO within a level.
 // Orders live in a pool (vector + free list) and link to each other by index,
 // so steady-state limit/cancel/match allocate nothing.
@@ -31,20 +44,26 @@ public:
         free_.reserve(capacity);
     }
 
-    // Returns false (rejected, book untouched) on zero qty, a live duplicate id,
-    // or a price outside the domain or the band of its own side.
-    bool limit(OrderId id, Side side, Price px, Qty qty, std::vector<Trade>& out) {
+    // Rejected (book untouched) on zero qty, a live duplicate id, or a price
+    // outside the domain or the band of its own side.
+    OrderResult limit(OrderId id, Side side, Price px, Qty qty, std::vector<Trade>& out) {
         Ladder& own = side == Side::Buy ? bids_ : asks_;
-        if (qty == 0 || !price_ok(own, px) || index_.find(id) != IdIndex::kMissing) return false;
-        qty = match(side == Side::Buy ? asks_ : bids_, id, side, px, qty, out);
-        if (qty) rest(own, id, side, px, qty);
-        return true;
+        if (qty == 0) return {OrderResult::Rejected, Reject::ZeroQty};
+        if (!price_ok(own, px)) return {OrderResult::Rejected, Reject::PriceBand};
+        if (index_.find(id) != IdIndex::kMissing) return {OrderResult::Rejected, Reject::DuplicateId};
+        Qty left = match(side == Side::Buy ? asks_ : bids_, id, side, px, qty, out);
+        if (!left) return {OrderResult::Filled, Reject::None, qty};
+        rest(own, id, side, px, left);
+        return {OrderResult::Rested, Reject::None, qty - left};
     }
 
     // Fills against whatever is on the book; any remainder is dropped (IOC).
-    void market(OrderId id, Side side, Qty qty, std::vector<Trade>& out) {
-        if (side == Side::Buy) match(asks_, id, side, std::numeric_limits<Price>::max(), qty, out);
-        else match(bids_, id, side, std::numeric_limits<Price>::min(), qty, out);
+    OrderResult market(OrderId id, Side side, Qty qty, std::vector<Trade>& out) {
+        if (qty == 0) return {OrderResult::Rejected, Reject::ZeroQty};
+        Qty left = side == Side::Buy
+                       ? match(asks_, id, side, std::numeric_limits<Price>::max(), qty, out)
+                       : match(bids_, id, side, std::numeric_limits<Price>::min(), qty, out);
+        return {left ? OrderResult::Cancelled : OrderResult::Filled, Reject::None, qty - left};
     }
 
     bool cancel(OrderId id) {
@@ -55,14 +74,16 @@ public:
     }
 
     // Cancel-replace: order loses time priority and may trade at the new price.
-    // Returns false if the id is unknown, new qty is zero, or the new price is
-    // out of band. Everything is checked before cancelling, so a rejected
-    // replace leaves the original order resting untouched.
-    bool modify(OrderId id, Price px, Qty qty, std::vector<Trade>& out) {
+    // Rejected if the id is unknown, new qty is zero, or the new price is out
+    // of band. Everything is checked before cancelling, so a rejected replace
+    // leaves the original order resting untouched.
+    OrderResult modify(OrderId id, Price px, Qty qty, std::vector<Trade>& out) {
         uint32_t o = index_.find(id);
-        if (o == IdIndex::kMissing || qty == 0) return false;
+        if (o == IdIndex::kMissing) return {OrderResult::Rejected, Reject::UnknownOrder};
+        if (qty == 0) return {OrderResult::Rejected, Reject::ZeroQty};
         Side side = pool_[o].side;
-        if (!price_ok(side == Side::Buy ? bids_ : asks_, px)) return false;
+        if (!price_ok(side == Side::Buy ? bids_ : asks_, px))
+            return {OrderResult::Rejected, Reject::PriceBand};
         cancel(id);
         return limit(id, side, px, qty, out);
     }

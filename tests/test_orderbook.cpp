@@ -200,7 +200,32 @@ static void test_price_band_rejects() {
     assert(b.limit(4, Side::Sell, 1000 + OrderBook::kMaxSpan, 5, t));    // other side is empty: ok
 }
 
+static void test_result_status_and_reasons() {
+    OrderBook b;
+    std::vector<Trade> t;
+    auto r = b.limit(1, Side::Sell, 100, 10, t);
+    assert(r.status == OrderResult::Rested && r.filled == 0);
+
+    r = b.limit(2, Side::Buy, 100, 4, t);
+    assert(r.status == OrderResult::Filled && r.filled == 4);
+
+    r = b.limit(3, Side::Buy, 100, 10, t);  // takes the remaining 6, rests 4
+    assert(r.status == OrderResult::Rested && r.filled == 6);
+
+    r = b.market(4, Side::Sell, 10, t);  // only 4 bid left
+    assert(r.status == OrderResult::Cancelled && r.filled == 4);
+
+    assert(b.limit(5, Side::Buy, 100, 0, t).reason == Reject::ZeroQty);
+    assert(b.market(6, Side::Buy, 0, t).reason == Reject::ZeroQty);
+    b.limit(7, Side::Buy, 100, 1, t);
+    assert(b.limit(7, Side::Buy, 100, 1, t).reason == Reject::DuplicateId);
+    assert(b.limit(8, Side::Buy, OrderBook::kMaxAbsPrice, 1, t).reason == Reject::PriceBand);
+    assert(b.modify(99, 100, 1, t).reason == Reject::UnknownOrder);
+    assert(b.modify(7, 100, 0, t).reason == Reject::ZeroQty);
+}
+
 int main() {
+    test_result_status_and_reasons();
     test_ladder_growth_and_gaps();
     test_price_band_rejects();
     test_modify_loses_priority();
