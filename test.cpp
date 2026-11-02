@@ -96,7 +96,36 @@ static void test_market_order_sweeps_and_drops_remainder() {
     assert(t.empty());
 }
 
+static void test_cancel() {
+    OrderBook b;
+    std::vector<Trade> t;
+    b.limit(1, Side::Buy, 100, 5, t);
+    b.limit(2, Side::Buy, 100, 5, t);
+    b.limit(3, Side::Sell, 105, 5, t);
+
+    assert(b.cancel(1));
+    assert(!b.cancel(1));    // already gone
+    assert(!b.cancel(999));  // never existed
+    assert(b.depth(Side::Buy, 100) == 5);
+
+    assert(b.cancel(3));
+    assert(!b.best_ask());  // empty level removed
+
+    b.limit(4, Side::Sell, 100, 5, t);  // cancelled order must not trade
+    assert(t.size() == 1 && t[0].buy_id == 2);
+}
+
+static void test_cancel_after_full_fill_fails() {
+    OrderBook b;
+    std::vector<Trade> t;
+    b.limit(1, Side::Sell, 100, 5, t);
+    b.market(2, Side::Buy, 5, t);
+    assert(!b.cancel(1));
+}
+
 int main() {
+    test_cancel();
+    test_cancel_after_full_fill_fails();
     test_market_order_sweeps_and_drops_remainder();
     test_resting_orders();
     test_crossing_limit_partial_fill();

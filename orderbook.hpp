@@ -50,6 +50,16 @@ public:
         else match(bids_, id, side, std::numeric_limits<Price>::min(), qty, out);
     }
 
+    bool cancel(OrderId id) {
+        auto it = index_.find(id);
+        if (it == index_.end()) return false;
+        Level::iterator o = it->second;
+        if (o->side == Side::Buy) unlink(bids_, o);
+        else unlink(asks_, o);
+        index_.erase(it);
+        return true;
+    }
+
     std::optional<Price> best_bid() const { return best(bids_); }
     std::optional<Price> best_ask() const { return best(asks_); }
 
@@ -92,6 +102,13 @@ private:
         Level& q = levels[px];
         q.push_back({id, side, px, qty});
         index_[id] = std::prev(q.end());
+    }
+
+    template <class Levels>
+    static void unlink(Levels& levels, Level::iterator o) {
+        auto lvl = levels.find(o->price);
+        lvl->second.erase(o);
+        if (lvl->second.empty()) levels.erase(lvl);
     }
 
     template <class Levels>
