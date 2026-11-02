@@ -87,3 +87,26 @@ throughput implies about 34 ns/op on average. Sub-tick precision needs `rdtsc` o
 - **Order id lookup** uses open addressing with linear probing, Fibonacci hashing, a load factor
   of at most 1/2, and backward-shift deletion with no tombstones. `test.cpp` checks it against
   `std::unordered_map` over 200k random operations.
+
+## S2: exchange features on the hot path
+
+S2 added the following to `OrderBook`:
+
+- A running quantity per level, which makes `Level` 16 bytes.
+- A level-change hook.
+- Time in force, with a `tif` byte per order.
+- Self-trade prevention, with an `account` field per order and one compare per fill.
+- Status and reason codes on every call.
+
+`Order` is still 40 bytes, enforced by a `static_assert`. The bench uses none of the new
+features, so this measures the cost a plain order pays for them.
+
+The S1 and S2 builds ran alternately, 7 runs each, on the same machine and workload:
+
+| build | median M ops/s | range        |
+|-------|---------------:|--------------|
+| S1    | 26.72          | 16.09 - 31.23 |
+| S2    | 28.39          | 21.90 - 29.98 |
+
+The cost is not measurable; the difference is within run-to-run noise. The trade checksum is
+still `2a79b8de12e4cd7d`, and the timed pass still makes zero heap allocations.
