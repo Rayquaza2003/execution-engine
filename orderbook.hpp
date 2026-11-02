@@ -32,9 +32,13 @@ struct Trade {
 class OrderBook {
 public:
     bool limit(OrderId id, Side side, Price px, Qty qty, std::vector<Trade>& out) {
-        (void)out;
-        if (side == Side::Buy) rest(bids_, id, side, px, qty);
-        else rest(asks_, id, side, px, qty);
+        if (side == Side::Buy) {
+            qty = match(asks_, id, side, px, qty, out);
+            if (qty) rest(bids_, id, side, px, qty);
+        } else {
+            qty = match(bids_, id, side, px, qty, out);
+            if (qty) rest(asks_, id, side, px, qty);
+        }
         return true;
     }
 
@@ -49,6 +53,31 @@ public:
 
 private:
     using Level = std::list<Order>;
+
+    // Fill against the opposite side while it crosses px. Trades print at the
+    // resting order's price. Returns the unfilled quantity.
+    template <class Levels>
+    Qty match(Levels& levels, OrderId id, Side side, Price px, Qty qty, std::vector<Trade>& out) {
+        while (qty && !levels.empty()) {
+            auto lvl = levels.begin();
+            if (side == Side::Buy ? lvl->first > px : lvl->first < px) break;
+            Level& q = lvl->second;
+            while (qty && !q.empty()) {
+                Order& resting = q.front();
+                Qty n = std::min(qty, resting.qty);
+                out.push_back(side == Side::Buy ? Trade{id, resting.id, resting.price, n}
+                                                : Trade{resting.id, id, resting.price, n});
+                qty -= n;
+                resting.qty -= n;
+                if (resting.qty == 0) {
+                    index_.erase(resting.id);
+                    q.pop_front();
+                }
+            }
+            if (q.empty()) levels.erase(lvl);
+        }
+        return qty;
+    }
 
     template <class Levels>
     void rest(Levels& levels, OrderId id, Side side, Price px, Qty qty) {
