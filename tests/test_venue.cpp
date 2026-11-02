@@ -141,7 +141,90 @@ static void test_end_of_day() {
     assert(v.book(b).leaves(2) == 5 && o.levels.size() == 2);
 }
 
+static NewOrder stop(OrderId id, SymbolId sym, Side side, Price stop_px, Price px, Qty qty,
+                     Tif tif = Tif::Day) {
+    NewOrder o{id, 0, sym, side, OrdType::StopLimit, tif, px, qty};
+    o.stop_px = stop_px;
+    return o;
+}
+
+static void test_buy_stop_triggers_at_or_above() {
+    Venue v;
+    VenueOut o;
+    SymbolId s = v.add_symbol();
+    v.on_new(stop(1, s, Side::Buy, 102, 105, 4), o);
+    assert((types(o) == std::vector<E>{E::New}) && v.book(s).order_count() == 0);
+
+    v.on_new(lim(2, s, Side::Sell, 101, 1), o);
+    v.on_new(lim(3, s, Side::Buy, 101, 1), o);  // prints 101: below trigger
+    assert(o.reports.back().type == E::Trade);
+
+    v.on_new(lim(4, s, Side::Sell, 102, 1), o);
+    v.on_new(lim(5, s, Side::Sell, 104, 10), o);
+    o.clear();
+    v.on_new(lim(6, s, Side::Buy, 102, 1), o);  // prints 102: fires the stop
+    assert((types(o) == std::vector<E>{E::New, E::Trade, E::Trade, E::Triggered, E::Trade, E::Trade}));
+    assert(o.reports[3].id == 1 && o.reports[4].id == 1 && o.reports[4].last_px == 104 &&
+           o.reports[4].last_qty == 4 && o.reports[4].leaves == 0);
+}
+
+static void test_sell_stop_and_cascade() {
+    Venue v;
+    VenueOut o;
+    SymbolId s = v.add_symbol();
+    v.on_new(lim(1, s, Side::Buy, 99, 2), o);
+    v.on_new(lim(2, s, Side::Buy, 97, 5), o);
+    v.on_new(stop(10, s, Side::Sell, 99, 90, 2), o);  // fires at <= 99, sells into 97
+    v.on_new(stop(11, s, Side::Sell, 97, 90, 1), o);  // fires once 97 prints
+    o.clear();
+    v.on_new(mkt(3, s, Side::Sell, 1), o);  // prints 99
+    std::vector<E> want{E::New, E::Trade, E::Trade,
+                        E::Triggered, E::Trade, E::Trade, E::Trade, E::Trade,  // 10: 1@99, 1@97
+                        E::Triggered, E::Trade, E::Trade};                     // 11: 1@97
+    assert(types(o) == want);
+    assert(o.reports[3].id == 10 && o.reports[8].id == 11);
+    assert(v.book(s).depth(Side::Buy, 97) == 3);
+}
+
+static void test_stop_already_through_fires_on_arrival() {
+    Venue v;
+    VenueOut o;
+    SymbolId s = v.add_symbol();
+    v.on_new(lim(1, s, Side::Sell, 100, 5), o);
+    v.on_new(lim(2, s, Side::Buy, 100, 1), o);  // last = 100
+    o.clear();
+    v.on_new(stop(3, s, Side::Buy, 99, 100, 2), o);
+    assert((types(o) == std::vector<E>{E::New, E::Triggered, E::Trade, E::Trade}));
+}
+
+static void test_stop_cancel_replace_dup_and_expiry() {
+    Venue v;
+    VenueOut o;
+    SymbolId s = v.add_symbol();
+    v.on_new(stop(1, s, Side::Buy, 110, 111, 3), o);
+    v.on_new(stop(2, s, Side::Sell, 90, 89, 3, Tif::Gtc), o);
+    v.on_new(stop(3, s, Side::Buy, 110, 111, 3), o);
+    v.on_new(lim(1, s, Side::Buy, 100, 1), o);  // id taken by a waiting stop
+    assert(o.reports.back().type == E::Rejected && o.reports.back().reason == Reject::DuplicateId);
+
+    o.clear();
+    v.on_replace({3, s, 112, 7}, o);
+    v.on_cancel({1, s}, o);
+    v.on_cancel({1, s}, o);
+    assert((types(o) == std::vector<E>{E::Replaced, E::Cancelled, E::CancelRejected}));
+
+    o.clear();
+    v.end_of_day(o);  // Day stop 3 expires, Gtc stop 2 stays
+    assert((types(o) == std::vector<E>{E::Expired}) && o.reports[0].id == 3);
+    v.on_cancel({2, s}, o);
+    assert(o.reports.back().type == E::Cancelled);
+}
+
 int main() {
+    test_buy_stop_triggers_at_or_above();
+    test_sell_stop_and_cascade();
+    test_stop_already_through_fires_on_arrival();
+    test_stop_cancel_replace_dup_and_expiry();
     test_unknown_symbol();
     test_symbols_are_independent();
     test_resting_ack();
