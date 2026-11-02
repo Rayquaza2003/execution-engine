@@ -35,9 +35,7 @@ public:
     // or a price outside the domain or the band of its own side.
     bool limit(OrderId id, Side side, Price px, Qty qty, std::vector<Trade>& out) {
         Ladder& own = side == Side::Buy ? bids_ : asks_;
-        if (qty == 0 || px <= -kMaxAbsPrice || px >= kMaxAbsPrice || !own.can_hold(px) ||
-            index_.find(id) != IdIndex::kMissing)
-            return false;
+        if (qty == 0 || !price_ok(own, px) || index_.find(id) != IdIndex::kMissing) return false;
         qty = match(side == Side::Buy ? asks_ : bids_, id, side, px, qty, out);
         if (qty) rest(own, id, side, px, qty);
         return true;
@@ -57,11 +55,14 @@ public:
     }
 
     // Cancel-replace: order loses time priority and may trade at the new price.
-    // Returns false if the id is unknown or new qty is zero (book untouched).
+    // Returns false if the id is unknown, new qty is zero, or the new price is
+    // out of band. Everything is checked before cancelling, so a rejected
+    // replace leaves the original order resting untouched.
     bool modify(OrderId id, Price px, Qty qty, std::vector<Trade>& out) {
         uint32_t o = index_.find(id);
         if (o == IdIndex::kMissing || qty == 0) return false;
         Side side = pool_[o].side;
+        if (!price_ok(side == Side::Buy ? bids_ : asks_, px)) return false;
         cancel(id);
         return limit(id, side, px, qty, out);
     }
@@ -154,6 +155,10 @@ private:
             }
         }
     };
+
+    static bool price_ok(const Ladder& own, Price px) {
+        return px > -kMaxAbsPrice && px < kMaxAbsPrice && own.can_hold(px);
+    }
 
     // Fill against the opposite side while it crosses px. Trades print at the
     // resting order's price. Returns the unfilled quantity.

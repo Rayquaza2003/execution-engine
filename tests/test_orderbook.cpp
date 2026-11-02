@@ -166,6 +166,10 @@ static void test_modify_rejects() {
     b.limit(1, Side::Buy, 100, 5, t);
     assert(!b.modify(1, 100, 0, t));   // zero qty rejected, order kept
     assert(b.depth(Side::Buy, 100) == 5);
+
+    b.limit(2, Side::Buy, 101, 5, t);
+    assert(!b.modify(1, 101 + OrderBook::kMaxSpan, 5, t));  // outside band: order must survive
+    assert(b.depth(Side::Buy, 100) == 5 && b.order_count() == 2);
 }
 
 static void test_ladder_growth_and_gaps() {
