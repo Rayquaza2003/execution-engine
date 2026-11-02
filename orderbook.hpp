@@ -33,7 +33,9 @@ struct Trade {
 // ponytail: std::map + std::list, node allocations on every insert; flat price ladder + pool in Phase 3.
 class OrderBook {
 public:
+    // Returns false (rejected, book untouched) on zero qty or a live duplicate id.
     bool limit(OrderId id, Side side, Price px, Qty qty, std::vector<Trade>& out) {
+        if (qty == 0 || index_.contains(id)) return false;
         if (side == Side::Buy) {
             qty = match(asks_, id, side, px, qty, out);
             if (qty) rest(bids_, id, side, px, qty);

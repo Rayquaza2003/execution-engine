@@ -123,7 +123,23 @@ static void test_cancel_after_full_fill_fails() {
     assert(!b.cancel(1));
 }
 
+static void test_rejects() {
+    OrderBook b;
+    std::vector<Trade> t;
+    assert(!b.limit(1, Side::Buy, 100, 0, t));  // zero qty
+    assert(b.order_count() == 0);
+
+    assert(b.limit(1, Side::Buy, 100, 5, t));
+    assert(!b.limit(1, Side::Sell, 90, 5, t));  // duplicate live id, must not trade
+    assert(t.empty());
+    assert(b.depth(Side::Buy, 100) == 5);
+
+    assert(b.cancel(1));
+    assert(b.limit(1, Side::Buy, 100, 5, t));  // id reusable once gone
+}
+
 int main() {
+    test_rejects();
     test_cancel();
     test_cancel_after_full_fill_fails();
     test_market_order_sweeps_and_drops_remainder();
