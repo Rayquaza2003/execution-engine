@@ -1,9 +1,9 @@
 #pragma once
 #include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <limits>
 #include <optional>
-#include <unordered_map>
 #include <vector>
 
 using OrderId = uint64_t;
@@ -19,6 +19,84 @@ struct Trade {
     Qty qty;
 };
 
+// OrderId -> pool index. Open addressing, linear probing, load factor <= 1/2,
+// backward-shift deletion (no tombstones), so insert/erase never allocate
+// unless the table has to double.
+class IdIndex {
+public:
+    static constexpr uint32_t kMissing = std::numeric_limits<uint32_t>::max();
+
+    explicit IdIndex(size_t expected) {
+        size_t cap = 16;
+        while (cap < 2 * expected) cap *= 2;
+        slots_.assign(cap, {0, kMissing});
+    }
+
+    size_t size() const { return size_; }
+
+    uint32_t find(OrderId key) const {
+        for (size_t i = home(key);; i = (i + 1) & mask()) {
+            if (slots_[i].val == kMissing) return kMissing;
+            if (slots_[i].key == key) return slots_[i].val;
+        }
+    }
+
+    // Key must be absent.
+    void insert(OrderId key, uint32_t val) {
+        if (2 * (size_ + 1) > slots_.size()) grow();
+        size_t i = home(key);
+        while (slots_[i].val != kMissing) i = (i + 1) & mask();
+        slots_[i] = {key, val};
+        ++size_;
+    }
+
+    // Removes key and returns its value, or kMissing if absent.
+    uint32_t take(OrderId key) {
+        size_t i = home(key);
+        while (slots_[i].key != key || slots_[i].val == kMissing) {
+            if (slots_[i].val == kMissing) return kMissing;
+            i = (i + 1) & mask();
+        }
+        uint32_t val = slots_[i].val;
+        // Pull later entries of the probe run back so lookups never hit a hole.
+        for (size_t j = (i + 1) & mask(); slots_[j].val != kMissing; j = (j + 1) & mask()) {
+            size_t h = home(slots_[j].key);
+            if (((j - h) & mask()) >= ((j - i) & mask())) {
+                slots_[i] = slots_[j];
+                i = j;
+            }
+        }
+        slots_[i].val = kMissing;
+        --size_;
+        return val;
+    }
+
+private:
+    struct Slot {
+        OrderId key;
+        uint32_t val;  // kMissing marks an empty slot
+    };
+
+    size_t mask() const { return slots_.size() - 1; }
+
+    // Fibonacci hashing: spreads sequential and strided ids across the table.
+    size_t home(OrderId key) const {
+        return size_t((key * 0x9E3779B97F4A7C15ull) >> (64 - std::countr_zero(slots_.size())));
+    }
+
+    void grow() {  // ponytail: doubling rehash is a latency spike; size `expected` up front
+        std::vector<Slot> old;
+        old.swap(slots_);
+        slots_.assign(old.size() * 2, {0, kMissing});
+        size_ = 0;
+        for (const Slot& s : old)
+            if (s.val != kMissing) insert(s.key, s.val);
+    }
+
+    std::vector<Slot> slots_;
+    size_t size_ = 0;
+};
+
 // Price-time priority: one flat array of price levels per side, FIFO within a level.
 // Orders live in a pool (vector + free list) and link to each other by index,
 // so steady-state limit/cancel/match allocate nothing.
@@ -30,14 +108,14 @@ public:
     // Accepted price domain; keeps every price difference inside int64.
     static constexpr Price kMaxAbsPrice = Price(1) << 62;
 
-    explicit OrderBook(size_t capacity = 1 << 16) { pool_.reserve(capacity); }
+    explicit OrderBook(size_t capacity = 1 << 16) : index_(capacity) { pool_.reserve(capacity); }
 
     // Returns false (rejected, book untouched) on zero qty, a live duplicate id,
     // or a price outside the domain or the band of its own side.
     bool limit(OrderId id, Side side, Price px, Qty qty, std::vector<Trade>& out) {
         Ladder& own = side == Side::Buy ? bids_ : asks_;
         if (qty == 0 || px <= -kMaxAbsPrice || px >= kMaxAbsPrice || !own.can_hold(px) ||
-            index_.contains(id))
+            index_.find(id) != IdIndex::kMissing)
             return false;
         qty = match(side == Side::Buy ? asks_ : bids_, id, side, px, qty, out);
         if (qty) rest(own, id, side, px, qty);
@@ -51,20 +129,18 @@ public:
     }
 
     bool cancel(OrderId id) {
-        auto it = index_.find(id);
-        if (it == index_.end()) return false;
-        uint32_t o = it->second;
+        uint32_t o = index_.take(id);
+        if (o == IdIndex::kMissing) return false;
         remove(pool_[o].side == Side::Buy ? bids_ : asks_, o);
-        index_.erase(it);
         return true;
     }
 
     // Cancel-replace: order loses time priority and may trade at the new price.
     // Returns false if the id is unknown or new qty is zero (book untouched).
     bool modify(OrderId id, Price px, Qty qty, std::vector<Trade>& out) {
-        auto it = index_.find(id);
-        if (it == index_.end() || qty == 0) return false;
-        Side side = pool_[it->second].side;
+        uint32_t o = index_.find(id);
+        if (o == IdIndex::kMissing || qty == 0) return false;
+        Side side = pool_[o].side;
         cancel(id);
         return limit(id, side, px, qty, out);
     }
@@ -174,7 +250,7 @@ private:
                 qty -= n;
                 resting.qty -= n;
                 if (resting.qty == 0) {
-                    index_.erase(resting.id);
+                    index_.take(resting.id);
                     unlink(q, h);
                     free_.push_back(h);
                 }
@@ -199,7 +275,7 @@ private:
         if (q.tail != kNil) pool_[q.tail].next = o;
         else q.head = o;
         q.tail = o;
-        index_[id] = o;
+        index_.insert(id, o);
     }
 
     void unlink(Level& q, uint32_t o) {
@@ -221,5 +297,5 @@ private:
     std::vector<Order> pool_;
     std::vector<uint32_t> free_;
     Ladder bids_{true}, asks_{false};
-    std::unordered_map<OrderId, uint32_t> index_;
+    IdIndex index_;
 };
