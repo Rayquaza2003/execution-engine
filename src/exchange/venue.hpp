@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdlib>
 #include <functional>
 #include <map>
 #include <unordered_map>
@@ -89,9 +90,19 @@ struct VenueOut {
     }
 };
 
+// Circuit breaker: if a trade prints more than band_bps away from the
+// reference price, the symbol halts for `halt` ns. The reference is the first
+// trade after start or a halt, and rolls to the latest trade every `window` ns.
+// band_bps = 0 turns it off.
+struct BreakerConfig {
+    uint32_t band_bps = 0;
+    Nanos window = 0;
+    Nanos halt = 0;
+};
+
 class Venue {
 public:
-    Venue() = default;
+    explicit Venue(BreakerConfig breaker = {}) : breaker_(breaker) {}
     Venue(const Venue&) = delete;  // books publish into changes_ by address
     Venue& operator=(const Venue&) = delete;
 
@@ -102,11 +113,16 @@ public:
         return SymbolId(books_.size() - 1);
     }
 
+    // Simulated time; the event loop sets it before delivering each request.
+    void set_time(Nanos now) { now_ = now; }
+    bool halted(SymbolId sym) const { return now_ < syms_[sym].halted_until; }
+
     const OrderBook& book(SymbolId sym) const { return books_[sym]; }
     size_t symbols() const { return books_.size(); }
 
     void on_new(const NewOrder& o, VenueOut& out) {
         if (o.sym >= books_.size()) return report(out, o.id, o.sym, ExecType::Rejected, Reject::UnknownSymbol);
+        if (halted(o.sym)) return report(out, o.id, o.sym, ExecType::Rejected, Reject::Halted);
         Sym& st = syms_[o.sym];
         if (st.stop_ids.count(o.id) || (o.type == OrdType::StopLimit && books_[o.sym].leaves(o.id)))
             return report(out, o.id, o.sym, ExecType::Rejected, Reject::DuplicateId);
@@ -136,6 +152,7 @@ public:
     void on_replace(const ReplaceRequest& rq, VenueOut& out) {
         if (rq.sym >= books_.size())
             return report(out, rq.id, rq.sym, ExecType::ReplaceRejected, Reject::UnknownSymbol);
+        if (halted(rq.sym)) return report(out, rq.id, rq.sym, ExecType::ReplaceRejected, Reject::Halted);
         if (NewOrder* stop = find_stop(rq.sym, rq.id)) {  // new limit price/qty, same trigger
             if (rq.qty == 0) return report(out, rq.id, rq.sym, ExecType::ReplaceRejected, Reject::ZeroQty);
             stop->px = rq.px;
@@ -148,6 +165,7 @@ public:
         fills(rq.sym, rq.id, rq.qty, out);
         if (r.status == OrderResult::Cancelled) report(out, rq.id, rq.sym, ExecType::Cancelled, r.reason);
         flush_levels(rq.sym, out);
+        check_breaker(rq.sym);
         run_stops(rq.sym, out);
     }
 
@@ -176,7 +194,32 @@ private:
         std::multimap<Price, NewOrder> buy_stops;                        // lowest trigger first
         std::multimap<Price, NewOrder, std::greater<Price>> sell_stops;  // highest trigger first
         std::unordered_map<OrderId, std::pair<Side, Price>> stop_ids;     // id -> where it waits
+        bool has_ref = false;  // circuit breaker reference
+        Price ref = 0;
+        Nanos ref_time = 0;
+        Nanos halted_until = 0;
     };
+
+    // ponytail: checks after the whole sweep, so one aggressive order can print
+    // beyond the band before the halt; reject the crossing part (LULD-style) if needed.
+    void check_breaker(SymbolId s) {
+        Sym& st = syms_[s];
+        if (!breaker_.band_bps || !st.has_last) return;
+        if (!st.has_ref) {
+            st.has_ref = true;
+            st.ref = st.last;
+            st.ref_time = now_;
+            return;
+        }
+        double move = double(std::llabs(st.last - st.ref)) * 10000.0;
+        if (move > double(std::llabs(st.ref)) * breaker_.band_bps) {
+            st.halted_until = now_ + breaker_.halt;
+            st.has_ref = false;  // first trade after the halt sets a new reference
+        } else if (now_ - st.ref_time >= breaker_.window) {
+            st.ref = st.last;
+            st.ref_time = now_;
+        }
+    }
 
     void execute(const NewOrder& o, bool ack, VenueOut& out) {
         OrderBook& b = books_[o.sym];
@@ -188,6 +231,7 @@ private:
         fills(o.sym, o.id, o.qty, out);
         if (r.status == OrderResult::Cancelled) report(out, o.id, o.sym, ExecType::Cancelled, r.reason);
         flush_levels(o.sym, out);
+        check_breaker(o.sym);
     }
 
     // Fire every stop the last trade price has reached, in trigger-price then
@@ -195,7 +239,7 @@ private:
     // stops, so keep going until nothing else fires.
     void run_stops(SymbolId s, VenueOut& out) {
         Sym& st = syms_[s];
-        while (st.has_last) {
+        while (st.has_last && !halted(s)) {
             NewOrder o;
             if (!st.buy_stops.empty() && st.buy_stops.begin()->first <= st.last) {
                 o = st.buy_stops.begin()->second;
@@ -265,6 +309,8 @@ private:
         changes_.clear();
     }
 
+    BreakerConfig breaker_;
+    Nanos now_ = 0;
     std::vector<OrderBook> books_;
     std::vector<Sym> syms_;
     std::vector<Trade> trades_;          // scratch, reused across calls

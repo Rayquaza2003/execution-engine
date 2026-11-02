@@ -220,7 +220,73 @@ static void test_stop_cancel_replace_dup_and_expiry() {
     assert(o.reports.back().type == E::Cancelled);
 }
 
+static void test_breaker_off_by_default() {
+    Venue v;
+    VenueOut o;
+    SymbolId s = v.add_symbol();
+    v.on_new(lim(1, s, Side::Sell, 100, 1), o);
+    v.on_new(lim(2, s, Side::Buy, 100, 1), o);
+    v.on_new(lim(3, s, Side::Sell, 200, 1), o);
+    v.on_new(lim(4, s, Side::Buy, 200, 1), o);  // +100%
+    assert(!v.halted(s));
+}
+
+static void test_breaker_halts_and_resumes() {
+    constexpr Nanos kSec = 1'000'000'000;
+    Venue v({500, 60 * kSec, 300 * kSec});  // 5% band, 1 min window, 5 min halt
+    VenueOut o;
+    SymbolId s = v.add_symbol();
+    v.on_new(lim(1, s, Side::Sell, 100, 1), o);
+    v.on_new(lim(2, s, Side::Buy, 100, 1), o);  // reference = 100
+    v.on_new(lim(3, s, Side::Sell, 105, 1), o);
+    v.on_new(lim(4, s, Side::Buy, 105, 1), o);  // exactly 5%: still inside the band
+    assert(!v.halted(s));
+
+    v.on_new(lim(5, s, Side::Buy, 90, 1), o);
+    v.on_new(stop(6, s, Side::Buy, 106, 120, 1), o);  // would fire on the next print
+    v.on_new(lim(7, s, Side::Sell, 106, 2), o);
+    v.set_time(10 * kSec);
+    v.on_new(lim(8, s, Side::Buy, 106, 1), o);  // 6% above 100: halt
+    assert(v.halted(s));
+    assert(o.reports.back().type != E::Triggered);  // stops do not fire into a halt
+
+    o.clear();
+    v.on_new(lim(9, s, Side::Buy, 106, 1), o);
+    v.on_replace({5, s, 91, 1}, o);
+    v.on_cancel({5, s}, o);  // cancels still work while halted
+    assert((types(o) == std::vector<E>{E::Rejected, E::ReplaceRejected, E::Cancelled}));
+    assert(o.reports[0].reason == Reject::Halted && o.reports[1].reason == Reject::Halted);
+
+    v.set_time(310 * kSec);
+    assert(!v.halted(s));
+    o.clear();
+    v.on_new(lim(10, s, Side::Buy, 106, 1), o);  // resumes; the waiting stop fires off this print
+    assert(o.reports[0].type == E::New && !v.halted(s));
+    bool triggered = false;
+    for (auto& r : o.reports) triggered |= r.type == E::Triggered && r.id == 6;
+    assert(triggered);
+}
+
+static void test_breaker_reference_rolls_with_window() {
+    constexpr Nanos kSec = 1'000'000'000;
+    Venue v({500, 60 * kSec, 300 * kSec});
+    VenueOut o;
+    SymbolId s = v.add_symbol();
+    OrderId id = 1;
+    Price px = 100;
+    for (int minute = 0; minute < 5; ++minute) {  // +4% per minute: never 5% from the reference
+        v.set_time(Nanos(minute) * 61 * kSec);
+        v.on_new(lim(id++, s, Side::Sell, px, 1), o);
+        v.on_new(lim(id++, s, Side::Buy, px, 1), o);
+        assert(!v.halted(s));
+        px = px * 104 / 100;
+    }
+}
+
 int main() {
+    test_breaker_off_by_default();
+    test_breaker_halts_and_resumes();
+    test_breaker_reference_rolls_with_window();
     test_buy_stop_triggers_at_or_above();
     test_sell_stop_and_cascade();
     test_stop_already_through_fires_on_arrival();
