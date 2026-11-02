@@ -224,7 +224,52 @@ static void test_result_status_and_reasons() {
     assert(b.modify(7, 100, 0, t).reason == Reject::ZeroQty);
 }
 
+static bool same(const std::vector<LevelChange>& a, const std::vector<LevelChange>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (a[i].side != b[i].side || a[i].price != b[i].price || a[i].qty != b[i].qty) return false;
+    return true;
+}
+
+static void test_level_change_feed() {
+    OrderBook b;
+    std::vector<Trade> t;
+    std::vector<LevelChange> lv;
+    b.publish_levels_to(&lv);
+
+    b.limit(1, Side::Sell, 101, 5, t);
+    b.limit(2, Side::Sell, 102, 5, t);
+    b.limit(3, Side::Sell, 102, 3, t);
+    assert(same(lv, {{Side::Sell, 101, 5}, {Side::Sell, 102, 5}, {Side::Sell, 102, 8}}));
+
+    lv.clear();
+    b.limit(4, Side::Buy, 102, 7, t);  // sweeps 101, takes 2 at 102: one update per level touched
+    assert(same(lv, {{Side::Sell, 101, 0}, {Side::Sell, 102, 6}}));
+
+    lv.clear();
+    b.limit(5, Side::Buy, 100, 9, t);
+    b.cancel(2);
+    b.cancel(5);
+    assert(same(lv, {{Side::Buy, 100, 9}, {Side::Sell, 102, 3}, {Side::Buy, 100, 0}}));
+}
+
+static void test_top_snapshot() {
+    OrderBook b;
+    std::vector<Trade> t;
+    assert(b.top(Side::Buy, 5).empty());
+    b.limit(1, Side::Buy, 100, 1, t);
+    b.limit(2, Side::Buy, 98, 2, t);
+    b.limit(3, Side::Buy, 95, 3, t);
+    b.limit(4, Side::Buy, 98, 4, t);
+    b.limit(5, Side::Sell, 103, 7, t);
+    assert(same(b.top(Side::Buy, 2), {{Side::Buy, 100, 1}, {Side::Buy, 98, 6}}));
+    assert(same(b.top(Side::Buy, 10), {{Side::Buy, 100, 1}, {Side::Buy, 98, 6}, {Side::Buy, 95, 3}}));
+    assert(same(b.top(Side::Sell, 10), {{Side::Sell, 103, 7}}));
+}
+
 int main() {
+    test_level_change_feed();
+    test_top_snapshot();
     test_result_status_and_reasons();
     test_ladder_growth_and_gaps();
     test_price_band_rejects();

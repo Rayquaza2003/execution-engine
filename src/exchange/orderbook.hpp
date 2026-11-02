@@ -15,6 +15,13 @@ struct Trade {
     Qty qty;
 };
 
+// Market-data view of one price level after a change; qty 0 means the level is gone.
+struct LevelChange {
+    Side side;
+    Price price;
+    Qty qty;
+};
+
 struct OrderResult {
     enum Status : uint8_t {
         Rejected,   // book untouched; see reason
@@ -97,6 +104,21 @@ public:
     }
 
     size_t order_count() const { return index_.size(); }
+
+    // Up to n non-empty levels from the best price outward (L2 snapshot).
+    std::vector<LevelChange> top(Side side, size_t n) const {
+        const Ladder& L = side == Side::Buy ? bids_ : asks_;
+        std::vector<LevelChange> v;
+        if (!L.live) return v;
+        Price step = L.is_bid ? -1 : 1, end = L.base + Price(L.levels.size());
+        for (Price p = L.best; v.size() < n && p >= L.base && p < end; p += step)
+            if (Qty q = L.levels[p - L.base].qty) v.push_back({side, p, q});
+        return v;
+    }
+
+    // When set, every level whose quantity changes is appended once per call
+    // (L2 incremental feed). Null by default, so the bench pays one branch.
+    void publish_levels_to(std::vector<LevelChange>* out) { levels_out_ = out; }
 
 private:
     static constexpr uint32_t kNil = std::numeric_limits<uint32_t>::max();
@@ -201,6 +223,7 @@ private:
                     free_.push_back(h);
                 }
             }
+            changed(side == Side::Buy ? Side::Sell : Side::Buy, p, q.qty);
             if (q.head == kNil) opp.emptied(p);
         }
         return qty;
@@ -223,6 +246,7 @@ private:
         q.tail = o;
         q.qty += qty;
         index_.insert(id, o);
+        changed(side, px, q.qty);
     }
 
     void unlink(Level& q, uint32_t o) {
@@ -239,11 +263,17 @@ private:
         q.qty -= pool_[o].qty;
         unlink(q, o);
         free_.push_back(o);
+        changed(pool_[o].side, p, q.qty);
         if (q.head == kNil) own.emptied(p);
+    }
+
+    void changed(Side side, Price p, Qty qty) {
+        if (levels_out_) levels_out_->push_back({side, p, qty});
     }
 
     std::vector<Order> pool_;
     std::vector<uint32_t> free_;
     Ladder bids_{true}, asks_{false};
     IdIndex index_;
+    std::vector<LevelChange>* levels_out_ = nullptr;
 };
