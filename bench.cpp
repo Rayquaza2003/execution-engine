@@ -4,11 +4,23 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <new>
 #include <random>
 
 #include "orderbook.hpp"
 
 using Clock = std::chrono::steady_clock;
+
+// Counts every heap allocation in the process, so the bench can prove the
+// steady-state hot path allocates nothing.
+static size_t g_allocs = 0;
+void* operator new(size_t n) {
+    ++g_allocs;
+    if (void* p = std::malloc(n ? n : 1)) return p;
+    throw std::bad_alloc();
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p, size_t) noexcept { std::free(p); }
 
 enum class OpType : uint8_t { Limit, Market, Cancel, Modify };
 
@@ -98,6 +110,7 @@ int main(int argc, char** argv) {
     trades.clear();
 
     size_t total_trades = 0;
+    size_t allocs_before = g_allocs;
     auto t0 = Clock::now();
     for (size_t i = kWarmup; i < n; ++i) {
         apply(book, ops[i], trades);
@@ -105,9 +118,11 @@ int main(int argc, char** argv) {
         trades.clear();
     }
     double secs = std::chrono::duration<double>(Clock::now() - t0).count();
+    size_t hot_allocs = g_allocs - allocs_before;
 
     size_t timed = n - kWarmup;
-    std::printf("ops %zu  trades %zu  resting %zu\n", timed, total_trades, book.order_count());
+    std::printf("ops %zu  trades %zu  resting %zu  hot-path allocations %zu\n", timed, total_trades,
+                book.order_count(), hot_allocs);
     std::printf("throughput %.2f M ops/s  (%.1f ns/op avg)\n\n", timed / secs / 1e6, secs * 1e9 / timed);
 
     // Latency pass: same ops, fresh book, each op bracketed by clock reads.
