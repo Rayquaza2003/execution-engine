@@ -1,5 +1,6 @@
 // Replays a deterministic synthetic order flow through the book.
 // Usage: ./bench [num_ops]   (default 10M)
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -65,6 +66,14 @@ static std::vector<Op> generate(size_t n, uint64_t seed) {
     return ops;
 }
 
+static void print_percentiles(const char* name, std::vector<uint32_t>& ns) {
+    if (ns.empty()) return;
+    std::sort(ns.begin(), ns.end());
+    auto pct = [&](double p) { return ns[size_t(p * (ns.size() - 1))]; };
+    std::printf("%-8s %10zu %8u %8u %8u %8u %8u %10u\n", name, ns.size(), pct(0.5), pct(0.9),
+                pct(0.99), pct(0.999), pct(0.9999), ns.back());
+}
+
 static inline void apply(OrderBook& b, const Op& op, std::vector<Trade>& t) {
     switch (op.type) {
         case OpType::Limit: b.limit(op.id, op.side, op.px, op.qty, t); break;
@@ -99,5 +108,33 @@ int main(int argc, char** argv) {
 
     size_t timed = n - kWarmup;
     std::printf("ops %zu  trades %zu  resting %zu\n", timed, total_trades, book.order_count());
-    std::printf("throughput %.2f M ops/s  (%.1f ns/op avg)\n", timed / secs / 1e6, secs * 1e9 / timed);
+    std::printf("throughput %.2f M ops/s  (%.1f ns/op avg)\n\n", timed / secs / 1e6, secs * 1e9 / timed);
+
+    // Latency pass: same ops, fresh book, each op bracketed by clock reads.
+    // Kept separate so clock overhead does not pollute the throughput number.
+    std::vector<uint32_t> lat[4];
+    size_t counts[4] = {};
+    for (size_t i = kWarmup; i < n; ++i) ++counts[size_t(ops[i].type)];
+    for (int k = 0; k < 4; ++k) lat[k].reserve(counts[k]);
+
+    OrderBook book2;
+    for (size_t i = 0; i < kWarmup; ++i) apply(book2, ops[i], trades);
+    trades.clear();
+    for (size_t i = kWarmup; i < n; ++i) {
+        auto a = Clock::now();
+        apply(book2, ops[i], trades);
+        auto b = Clock::now();
+        lat[size_t(ops[i].type)].push_back(
+            uint32_t(std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count()));
+        trades.clear();
+    }
+
+    std::printf("latency ns %10s %8s %8s %8s %8s %8s %10s\n", "count", "p50", "p90", "p99", "p99.9",
+                "p99.99", "max");
+    const char* names[4] = {"limit", "market", "cancel", "modify"};
+    std::vector<uint32_t> all;
+    all.reserve(timed);
+    for (int k = 0; k < 4; ++k) all.insert(all.end(), lat[k].begin(), lat[k].end());
+    for (int k = 0; k < 4; ++k) print_percentiles(names[k], lat[k]);
+    print_percentiles("all", all);
 }
