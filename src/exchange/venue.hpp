@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "core/ring.hpp"
 #include "core/types.hpp"
 #include "exchange/orderbook.hpp"
 
@@ -102,6 +103,9 @@ struct BreakerConfig {
 
 class Venue {
 public:
+    static constexpr size_t kTradeHistory = 1024;
+    using TradeHistory = Ring<TradePrint, kTradeHistory>;
+
     explicit Venue(BreakerConfig breaker = {}) : breaker_(breaker) {}
     Venue(const Venue&) = delete;  // books publish into changes_ by address
     Venue& operator=(const Venue&) = delete;
@@ -118,6 +122,7 @@ public:
     bool halted(SymbolId sym) const { return now_ < syms_[sym].halted_until; }
 
     const OrderBook& book(SymbolId sym) const { return books_[sym]; }
+    const TradeHistory& trades(SymbolId sym) const { return syms_[sym].recent; }
     size_t symbols() const { return books_.size(); }
 
     void on_new(const NewOrder& o, VenueOut& out) {
@@ -198,6 +203,7 @@ private:
         Price ref = 0;
         Nanos ref_time = 0;
         Nanos halted_until = 0;
+        TradeHistory recent;   // last kTradeHistory prints
     };
 
     // ponytail: checks after the whole sweep, so one aggressive order can print
@@ -298,6 +304,7 @@ private:
             report(out, aggressor, sym, ExecType::Trade, Reject::None, t.price, t.qty, left);
             report(out, resting, sym, ExecType::Trade, Reject::None, t.price, t.qty, b.leaves(resting));
             out.prints.push_back({sym, t.price, t.qty, buy ? Side::Buy : Side::Sell});
+            syms_[sym].recent.push(out.prints.back());
             syms_[sym].has_last = true;
             syms_[sym].last = t.price;
         }

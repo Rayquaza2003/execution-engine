@@ -283,7 +283,21 @@ static void test_breaker_reference_rolls_with_window() {
     }
 }
 
+static void test_trade_history() {
+    Venue v;
+    VenueOut o;
+    SymbolId s = v.add_symbol();
+    for (OrderId i = 0; i < 1500; ++i) {
+        v.on_new(lim(2 * i + 1, s, Side::Sell, 100 + Price(i % 7), 1), o);
+        v.on_new(lim(2 * i + 2, s, Side::Buy, 100 + Price(i % 7), 1), o);
+    }
+    const auto& h = v.trades(s);
+    assert(h.total_pushed() == 1500 && h.size() == Venue::kTradeHistory);
+    assert(h.newest().price == 100 + 1499 % 7 && h[0].price == 100 + (1500 - 1024) % 7);
+}
+
 int main() {
+    test_trade_history();
     test_breaker_off_by_default();
     test_breaker_halts_and_resumes();
     test_breaker_reference_rolls_with_window();
