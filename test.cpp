@@ -138,7 +138,40 @@ static void test_rejects() {
     assert(b.limit(1, Side::Buy, 100, 5, t));  // id reusable once gone
 }
 
+static void test_modify_loses_priority() {
+    OrderBook b;
+    std::vector<Trade> t;
+    b.limit(1, Side::Buy, 100, 5, t);
+    b.limit(2, Side::Buy, 100, 5, t);
+    assert(b.modify(1, 100, 5, t));  // same price, back of queue
+    b.limit(3, Side::Sell, 100, 5, t);
+    assert(t.size() == 1 && t[0].buy_id == 2);
+}
+
+static void test_modify_can_cross() {
+    OrderBook b;
+    std::vector<Trade> t;
+    b.limit(1, Side::Buy, 99, 5, t);
+    b.limit(2, Side::Sell, 101, 3, t);
+    assert(b.modify(1, 101, 5, t));
+    assert(t.size() == 1 && t[0].buy_id == 1 && t[0].price == 101 && t[0].qty == 3);
+    assert(*b.best_bid() == 101 && b.depth(Side::Buy, 101) == 2);
+    assert(b.depth(Side::Buy, 99) == 0);
+}
+
+static void test_modify_rejects() {
+    OrderBook b;
+    std::vector<Trade> t;
+    assert(!b.modify(42, 100, 5, t));  // unknown id
+    b.limit(1, Side::Buy, 100, 5, t);
+    assert(!b.modify(1, 100, 0, t));   // zero qty rejected, order kept
+    assert(b.depth(Side::Buy, 100) == 5);
+}
+
 int main() {
+    test_modify_loses_priority();
+    test_modify_can_cross();
+    test_modify_rejects();
     test_rejects();
     test_cancel();
     test_cancel_after_full_fill_fails();

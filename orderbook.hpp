@@ -62,6 +62,16 @@ public:
         return true;
     }
 
+    // Cancel-replace: order loses time priority and may trade at the new price.
+    // Returns false if the id is unknown or new qty is zero (book untouched).
+    bool modify(OrderId id, Price px, Qty qty, std::vector<Trade>& out) {
+        auto it = index_.find(id);
+        if (it == index_.end() || qty == 0) return false;
+        Side side = it->second->side;
+        cancel(id);
+        return limit(id, side, px, qty, out);
+    }
+
     std::optional<Price> best_bid() const { return best(bids_); }
     std::optional<Price> best_ask() const { return best(asks_); }
 
