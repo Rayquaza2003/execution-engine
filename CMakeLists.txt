@@ -16,6 +16,11 @@ set(CMAKE_EXE_LINKER_FLAGS_DEBUG "-fsanitize=address,undefined")
 
 include_directories(src)
 
-add_executable(test_orderbook tests/test_orderbook.cpp)
-add_executable(test_id_index tests/test_id_index.cpp)
+enable_testing()
+# One assert-based executable per module: tests/test_<name>.cpp
+foreach(name orderbook id_index)
+  add_executable(test_${name} tests/test_${name}.cpp)
+  add_test(NAME ${name} COMMAND test_${name})
+endforeach()
+
 add_executable(bench_book bench/bench_book.cpp)
