@@ -34,7 +34,7 @@ struct OrderResult {
 class OrderBook {
 public:
     // Price band: a resting side may span at most this many ticks. Real venues
-    // enforce collars too; it also bounds ladder memory (8 B per tick per side).
+    // enforce collars too; it also bounds ladder memory (16 B per tick per side).
     static constexpr Price kMaxSpan = 1 << 20;
     // Accepted price domain; keeps every price difference inside int64.
     static constexpr Price kMaxAbsPrice = Price(1) << 62;
@@ -93,10 +93,7 @@ public:
 
     Qty depth(Side side, Price px) const {
         const Level* q = (side == Side::Buy ? bids_ : asks_).find(px);
-        Qty total = 0;
-        if (q)
-            for (uint32_t o = q->head; o != kNil; o = pool_[o].next) total += pool_[o].qty;
-        return total;
+        return q ? q->qty : 0;
     }
 
     size_t order_count() const { return index_.size(); }
@@ -114,6 +111,7 @@ private:
 
     struct Level {
         uint32_t head = kNil, tail = kNil;
+        Qty qty = 0;  // total resting quantity, kept current on every change
     };
 
     // levels[i] holds price base + i. Grows (and recenters) on demand, never shrinks.
@@ -196,6 +194,7 @@ private:
                                                 : Trade{resting.id, id, p, n});
                 qty -= n;
                 resting.qty -= n;
+                q.qty -= n;
                 if (resting.qty == 0) {
                     index_.take(resting.id);
                     unlink(q, h);
@@ -222,6 +221,7 @@ private:
         if (q.tail != kNil) pool_[q.tail].next = o;
         else q.head = o;
         q.tail = o;
+        q.qty += qty;
         index_.insert(id, o);
     }
 
@@ -236,6 +236,7 @@ private:
     void remove(Ladder& own, uint32_t o) {
         Price p = pool_[o].price;
         Level& q = own.levels[p - own.base];
+        q.qty -= pool_[o].qty;
         unlink(q, o);
         free_.push_back(o);
         if (q.head == kNil) own.emptied(p);
