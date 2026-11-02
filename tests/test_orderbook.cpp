@@ -1,5 +1,6 @@
 #undef NDEBUG  // keep asserts on in Release builds
 #include <cassert>
+#include <algorithm>
 #include <cstdio>
 
 #include "exchange/orderbook.hpp"
@@ -267,7 +268,62 @@ static void test_top_snapshot() {
     assert(same(b.top(Side::Sell, 10), {{Side::Sell, 103, 7}}));
 }
 
+static void test_ioc() {
+    OrderBook b;
+    std::vector<Trade> t;
+    b.limit(1, Side::Sell, 100, 3, t);
+    auto r = b.limit(2, Side::Buy, 100, 5, t, Tif::Ioc);
+    assert(r.status == OrderResult::Cancelled && r.filled == 3 && t.size() == 1);
+    assert(!b.best_bid());  // remainder did not rest
+
+    r = b.limit(3, Side::Buy, 100, 5, t, Tif::Ioc);  // nothing to hit
+    assert(r.status == OrderResult::Cancelled && r.filled == 0 && b.order_count() == 0);
+}
+
+static void test_fok() {
+    OrderBook b;
+    std::vector<Trade> t;
+    b.limit(1, Side::Sell, 100, 3, t);
+    b.limit(2, Side::Sell, 101, 3, t);
+    b.limit(3, Side::Sell, 103, 10, t);
+
+    auto r = b.limit(4, Side::Buy, 101, 7, t, Tif::Fok);  // only 6 at or below 101
+    assert(r.status == OrderResult::Cancelled && r.filled == 0 && t.empty());
+    assert(b.depth(Side::Sell, 100) == 3 && b.depth(Side::Sell, 101) == 3);
+
+    r = b.limit(5, Side::Buy, 101, 6, t, Tif::Fok);  // exactly enough across two levels
+    assert(r.status == OrderResult::Filled && r.filled == 6 && t.size() == 2);
+    assert(*b.best_ask() == 103);
+
+    r = b.limit(6, Side::Sell, 90, 1, t, Tif::Fok);  // empty bid side
+    assert(r.status == OrderResult::Cancelled);
+}
+
+static void test_end_of_day_expires_day_orders_only() {
+    OrderBook b;
+    std::vector<Trade> t;
+    std::vector<LevelChange> lv;
+    b.limit(1, Side::Buy, 100, 5, t);             // Day by default
+    b.limit(2, Side::Buy, 100, 5, t, Tif::Gtc);
+    b.limit(3, Side::Sell, 105, 5, t, Tif::Day);
+    b.limit(4, Side::Buy, 99, 5, t, Tif::Gtc);
+    assert(b.modify(4, 98, 6, t));  // replace keeps Gtc
+    b.publish_levels_to(&lv);
+
+    std::vector<OrderId> expired;
+    b.end_of_day(expired);
+    std::sort(expired.begin(), expired.end());
+    assert((expired == std::vector<OrderId>{1, 3}));
+    assert(b.order_count() == 2 && b.depth(Side::Buy, 100) == 5 && b.depth(Side::Buy, 98) == 6);
+    assert(!b.best_ask() && *b.best_bid() == 100);
+    assert(lv.size() == 2);  // one level change per expired order
+    assert(!b.cancel(1) && b.cancel(2));
+}
+
 int main() {
+    test_ioc();
+    test_fok();
+    test_end_of_day_expires_day_orders_only();
     test_level_change_feed();
     test_top_snapshot();
     test_result_status_and_reasons();

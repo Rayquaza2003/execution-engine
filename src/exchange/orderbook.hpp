@@ -27,7 +27,7 @@ struct OrderResult {
         Rejected,   // book untouched; see reason
         Rested,     // some or none filled, remainder rests on the book
         Filled,     // fully executed
-        Cancelled,  // remainder dropped without resting (market order)
+        Cancelled,  // remainder dropped without resting (market, IOC, unfillable FOK)
     };
     Status status;
     Reject reason = Reject::None;
@@ -53,14 +53,18 @@ public:
 
     // Rejected (book untouched) on zero qty, a live duplicate id, or a price
     // outside the domain or the band of its own side.
-    OrderResult limit(OrderId id, Side side, Price px, Qty qty, std::vector<Trade>& out) {
+    OrderResult limit(OrderId id, Side side, Price px, Qty qty, std::vector<Trade>& out,
+                      Tif tif = Tif::Day) {
         Ladder& own = side == Side::Buy ? bids_ : asks_;
+        Ladder& opp = side == Side::Buy ? asks_ : bids_;
         if (qty == 0) return {OrderResult::Rejected, Reject::ZeroQty};
         if (!price_ok(own, px)) return {OrderResult::Rejected, Reject::PriceBand};
         if (index_.find(id) != IdIndex::kMissing) return {OrderResult::Rejected, Reject::DuplicateId};
-        Qty left = match(side == Side::Buy ? asks_ : bids_, id, side, px, qty, out);
+        if (tif == Tif::Fok && !can_fill(opp, side, px, qty)) return {OrderResult::Cancelled};
+        Qty left = match(opp, id, side, px, qty, out);
         if (!left) return {OrderResult::Filled, Reject::None, qty};
-        rest(own, id, side, px, left);
+        if (tif == Tif::Ioc) return {OrderResult::Cancelled, Reject::None, qty - left};
+        rest(own, id, side, px, left, tif);
         return {OrderResult::Rested, Reject::None, qty - left};
     }
 
@@ -89,10 +93,27 @@ public:
         if (o == IdIndex::kMissing) return {OrderResult::Rejected, Reject::UnknownOrder};
         if (qty == 0) return {OrderResult::Rejected, Reject::ZeroQty};
         Side side = pool_[o].side;
+        Tif tif = pool_[o].tif;
         if (!price_ok(side == Side::Buy ? bids_ : asks_, px))
             return {OrderResult::Rejected, Reject::PriceBand};
         cancel(id);
-        return limit(id, side, px, qty, out);
+        return limit(id, side, px, qty, out, tif);
+    }
+
+    // Session close: removes every resting Day order (Gtc survives) and appends
+    // its id to `expired`.
+    void end_of_day(std::vector<OrderId>& expired) {
+        for (Ladder* L : {&bids_, &asks_})
+            for (size_t i = 0; i < L->levels.size() && L->live; ++i)
+                for (uint32_t o = L->levels[i].head; o != kNil;) {
+                    uint32_t next = pool_[o].next;
+                    if (pool_[o].tif == Tif::Day) {
+                        expired.push_back(pool_[o].id);
+                        index_.take(pool_[o].id);
+                        remove(*L, o);
+                    }
+                    o = next;
+                }
     }
 
     std::optional<Price> best_bid() const { return bids_.top(); }
@@ -129,6 +150,7 @@ private:
         Qty qty;
         uint32_t prev, next;  // pool indices within the price level
         Side side;
+        Tif tif;  // Day or Gtc; Ioc/Fok never rest
     };
 
     struct Level {
@@ -201,6 +223,19 @@ private:
         return px > -kMaxAbsPrice && px < kMaxAbsPrice && own.can_hold(px);
     }
 
+    // FOK pre-check: is there at least qty resting at prices that cross px?
+    static bool can_fill(const Ladder& opp, Side side, Price px, Qty qty) {
+        if (!opp.live) return false;
+        Price step = opp.is_bid ? -1 : 1, end = opp.base + Price(opp.levels.size());
+        Qty avail = 0;
+        for (Price p = opp.best; p >= opp.base && p < end; p += step) {
+            if (side == Side::Buy ? p > px : p < px) return false;
+            avail += opp.levels[p - opp.base].qty;
+            if (avail >= qty) return true;
+        }
+        return false;
+    }
+
     // Fill against the opposite side while it crosses px. Trades print at the
     // resting order's price. Returns the unfilled quantity.
     Qty match(Ladder& opp, OrderId id, Side side, Price px, Qty qty, std::vector<Trade>& out) {
@@ -229,7 +264,7 @@ private:
         return qty;
     }
 
-    void rest(Ladder& own, OrderId id, Side side, Price px, Qty qty) {
+    void rest(Ladder& own, OrderId id, Side side, Price px, Qty qty, Tif tif) {
         uint32_t o;
         if (free_.empty()) {
             o = uint32_t(pool_.size());
@@ -240,7 +275,7 @@ private:
         }
         Level& q = own.at(px);
         if (q.head == kNil) own.filled(px);
-        pool_[o] = {id, px, qty, q.tail, kNil, side};
+        pool_[o] = {id, px, qty, q.tail, kNil, side, tif};
         if (q.tail != kNil) pool_[q.tail].next = o;
         else q.head = o;
         q.tail = o;

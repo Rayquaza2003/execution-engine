@@ -9,6 +9,10 @@ using Nanos = uint64_t;  // simulated time since session start
 
 enum class Side : uint8_t { Buy, Sell };
 
+// Time in force. Day rests until end_of_day; Gtc rests until cancelled;
+// Ioc fills what it can now and drops the rest; Fok fills completely or not at all.
+enum class Tif : uint8_t { Day, Gtc, Ioc, Fok };
+
 // Why an order or request was refused. Shared so every layer reports the same codes.
 enum class Reject : uint8_t {
     None,
