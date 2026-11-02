@@ -1,9 +1,7 @@
 #pragma once
 #include <algorithm>
 #include <cstdint>
-#include <functional>
 #include <limits>
-#include <map>
 #include <optional>
 #include <unordered_map>
 #include <vector>
@@ -21,24 +19,28 @@ struct Trade {
     Qty qty;
 };
 
-// Price-time priority: levels sorted by price, FIFO within a level.
+// Price-time priority: one flat array of price levels per side, FIFO within a level.
 // Orders live in a pool (vector + free list) and link to each other by index,
-// so resting an order allocates nothing once the pool has warmed up.
-// ponytail: std::map levels still allocate per new price; flat ladder next.
+// so steady-state limit/cancel/match allocate nothing.
 class OrderBook {
 public:
+    // Price band: a resting side may span at most this many ticks. Real venues
+    // enforce collars too; it also bounds ladder memory (8 B per tick per side).
+    static constexpr Price kMaxSpan = 1 << 20;
+    // Accepted price domain; keeps every price difference inside int64.
+    static constexpr Price kMaxAbsPrice = Price(1) << 62;
+
     explicit OrderBook(size_t capacity = 1 << 16) { pool_.reserve(capacity); }
 
-    // Returns false (rejected, book untouched) on zero qty or a live duplicate id.
+    // Returns false (rejected, book untouched) on zero qty, a live duplicate id,
+    // or a price outside the domain or the band of its own side.
     bool limit(OrderId id, Side side, Price px, Qty qty, std::vector<Trade>& out) {
-        if (qty == 0 || index_.contains(id)) return false;
-        if (side == Side::Buy) {
-            qty = match(asks_, id, side, px, qty, out);
-            if (qty) rest(bids_, id, side, px, qty);
-        } else {
-            qty = match(bids_, id, side, px, qty, out);
-            if (qty) rest(asks_, id, side, px, qty);
-        }
+        Ladder& own = side == Side::Buy ? bids_ : asks_;
+        if (qty == 0 || px <= -kMaxAbsPrice || px >= kMaxAbsPrice || !own.can_hold(px) ||
+            index_.contains(id))
+            return false;
+        qty = match(side == Side::Buy ? asks_ : bids_, id, side, px, qty, out);
+        if (qty) rest(own, id, side, px, qty);
         return true;
     }
 
@@ -52,8 +54,7 @@ public:
         auto it = index_.find(id);
         if (it == index_.end()) return false;
         uint32_t o = it->second;
-        if (pool_[o].side == Side::Buy) remove(bids_, o);
-        else remove(asks_, o);
+        remove(pool_[o].side == Side::Buy ? bids_ : asks_, o);
         index_.erase(it);
         return true;
     }
@@ -68,11 +69,15 @@ public:
         return limit(id, side, px, qty, out);
     }
 
-    std::optional<Price> best_bid() const { return best(bids_); }
-    std::optional<Price> best_ask() const { return best(asks_); }
+    std::optional<Price> best_bid() const { return bids_.top(); }
+    std::optional<Price> best_ask() const { return asks_.top(); }
 
     Qty depth(Side side, Price px) const {
-        return side == Side::Buy ? level_qty(bids_, px) : level_qty(asks_, px);
+        const Level* q = (side == Side::Buy ? bids_ : asks_).find(px);
+        Qty total = 0;
+        if (q)
+            for (uint32_t o = q->head; o != kNil; o = pool_[o].next) total += pool_[o].qty;
+        return total;
     }
 
     size_t order_count() const { return index_.size(); }
@@ -92,20 +97,80 @@ private:
         uint32_t head = kNil, tail = kNil;
     };
 
+    // levels[i] holds price base + i. Grows (and recenters) on demand, never shrinks.
+    // ponytail: a side that drifts kMaxSpan ticks while never emptying starts
+    // rejecting; slide the window (copy live levels) if a symbol ever does that.
+    struct Ladder {
+        bool is_bid;
+        Price base = 0;
+        std::vector<Level> levels;
+        Price best = 0;   // valid only when live > 0
+        size_t live = 0;  // non-empty levels
+
+        explicit Ladder(bool bid) : is_bid(bid) {}
+
+        std::optional<Price> top() const {
+            return live ? std::optional<Price>(best) : std::nullopt;
+        }
+
+        const Level* find(Price p) const {
+            if (p < base || p - base >= Price(levels.size())) return nullptr;
+            return &levels[p - base];
+        }
+
+        bool can_hold(Price p) const {
+            if (!live) return true;
+            Price lo = std::min(p, best), hi = std::max(p, best);
+            // The far edge of the ladder is unknown, so bound by the spread of
+            // the full array; cheap and conservative.
+            lo = std::min(lo, base);
+            hi = std::max(hi, base + Price(levels.size()) - 1);
+            return hi - lo < kMaxSpan;
+        }
+
+        Level& at(Price p) {
+            if (!live) {  // all empty: recenter for free
+                if (levels.empty()) levels.resize(4096);
+                if (!find(p)) base = p - Price(levels.size()) / 2;
+            } else if (!find(p)) {
+                Price lo = std::min(p, base), hi = std::max(p + 1, base + Price(levels.size()));
+                Price size = std::min<Price>(std::max<Price>(2 * Price(levels.size()), 2 * (hi - lo)), kMaxSpan);
+                Price new_base = lo - (size - (hi - lo)) / 2;
+                std::vector<Level> grown(size);
+                std::copy(levels.begin(), levels.end(), grown.begin() + (base - new_base));
+                levels.swap(grown);
+                base = new_base;
+            }
+            return levels[p - base];
+        }
+
+        void filled(Price p) {  // level p went empty -> non-empty
+            if (!live++ || (is_bid ? p > best : p < best)) best = p;
+        }
+
+        void emptied(Price p) {  // level p went non-empty -> empty
+            if (--live && p == best) {
+                // ponytail: linear scan to next level, O(gap); fine for dense books.
+                Price step = is_bid ? -1 : 1;
+                do best += step;
+                while (levels[best - base].head == kNil);
+            }
+        }
+    };
+
     // Fill against the opposite side while it crosses px. Trades print at the
     // resting order's price. Returns the unfilled quantity.
-    template <class Levels>
-    Qty match(Levels& levels, OrderId id, Side side, Price px, Qty qty, std::vector<Trade>& out) {
-        while (qty && !levels.empty()) {
-            auto lvl = levels.begin();
-            if (side == Side::Buy ? lvl->first > px : lvl->first < px) break;
-            Level& q = lvl->second;
+    Qty match(Ladder& opp, OrderId id, Side side, Price px, Qty qty, std::vector<Trade>& out) {
+        while (qty && opp.live) {
+            Price p = opp.best;
+            if (side == Side::Buy ? p > px : p < px) break;
+            Level& q = opp.levels[p - opp.base];
             while (qty && q.head != kNil) {
                 uint32_t h = q.head;
                 Order& resting = pool_[h];
                 Qty n = std::min(qty, resting.qty);
-                out.push_back(side == Side::Buy ? Trade{id, resting.id, resting.price, n}
-                                                : Trade{resting.id, id, resting.price, n});
+                out.push_back(side == Side::Buy ? Trade{id, resting.id, p, n}
+                                                : Trade{resting.id, id, p, n});
                 qty -= n;
                 resting.qty -= n;
                 if (resting.qty == 0) {
@@ -114,13 +179,12 @@ private:
                     free_.push_back(h);
                 }
             }
-            if (q.head == kNil) levels.erase(lvl);
+            if (q.head == kNil) opp.emptied(p);
         }
         return qty;
     }
 
-    template <class Levels>
-    void rest(Levels& levels, OrderId id, Side side, Price px, Qty qty) {
+    void rest(Ladder& own, OrderId id, Side side, Price px, Qty qty) {
         uint32_t o;
         if (free_.empty()) {
             o = uint32_t(pool_.size());
@@ -129,7 +193,8 @@ private:
             o = free_.back();
             free_.pop_back();
         }
-        Level& q = levels[px];
+        Level& q = own.at(px);
+        if (q.head == kNil) own.filled(px);
         pool_[o] = {id, px, qty, q.tail, kNil, side};
         if (q.tail != kNil) pool_[q.tail].next = o;
         else q.head = o;
@@ -145,32 +210,16 @@ private:
         else q.tail = x.prev;
     }
 
-    template <class Levels>
-    void remove(Levels& levels, uint32_t o) {
-        auto lvl = levels.find(pool_[o].price);
-        unlink(lvl->second, o);
+    void remove(Ladder& own, uint32_t o) {
+        Price p = pool_[o].price;
+        Level& q = own.levels[p - own.base];
+        unlink(q, o);
         free_.push_back(o);
-        if (lvl->second.head == kNil) levels.erase(lvl);
-    }
-
-    template <class Levels>
-    static std::optional<Price> best(const Levels& levels) {
-        if (levels.empty()) return std::nullopt;
-        return levels.begin()->first;
-    }
-
-    template <class Levels>
-    Qty level_qty(const Levels& levels, Price px) const {
-        auto lvl = levels.find(px);
-        if (lvl == levels.end()) return 0;
-        Qty total = 0;
-        for (uint32_t o = lvl->second.head; o != kNil; o = pool_[o].next) total += pool_[o].qty;
-        return total;
+        if (q.head == kNil) own.emptied(p);
     }
 
     std::vector<Order> pool_;
     std::vector<uint32_t> free_;
-    std::map<Price, Level, std::greater<Price>> bids_;  // best (highest) first
-    std::map<Price, Level> asks_;                        // best (lowest) first
+    Ladder bids_{true}, asks_{false};
     std::unordered_map<OrderId, uint32_t> index_;
 };

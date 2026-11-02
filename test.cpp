@@ -168,7 +168,37 @@ static void test_modify_rejects() {
     assert(b.depth(Side::Buy, 100) == 5);
 }
 
+static void test_ladder_growth_and_gaps() {
+    OrderBook b;
+    std::vector<Trade> t;
+    b.limit(1, Side::Sell, 100, 1, t);
+    b.limit(2, Side::Sell, 200'000, 1, t);  // forces growth well past initial size
+    b.limit(3, Side::Sell, -50'000, 1, t);  // negative prices allowed; grows downward
+    assert(*b.best_ask() == -50'000);
+
+    assert(b.cancel(3));
+    assert(*b.best_ask() == 100);  // scans across the gap
+    b.market(4, Side::Buy, 2, t);
+    assert(t.size() == 2 && t[0].price == 100 && t[1].price == 200'000);
+    assert(!b.best_ask());
+
+    b.limit(5, Side::Sell, 9'000'000, 1, t);  // empty side recenters anywhere
+    assert(*b.best_ask() == 9'000'000);
+}
+
+static void test_price_band_rejects() {
+    OrderBook b;
+    std::vector<Trade> t;
+    b.limit(1, Side::Buy, 1000, 5, t);
+    assert(!b.limit(2, Side::Buy, 1000 + OrderBook::kMaxSpan, 5, t));  // too far from own side
+    assert(!b.limit(3, Side::Sell, OrderBook::kMaxAbsPrice, 5, t));      // outside price domain
+    assert(t.empty() && b.order_count() == 1);
+    assert(b.limit(4, Side::Sell, 1000 + OrderBook::kMaxSpan, 5, t));    // other side is empty: ok
+}
+
 int main() {
+    test_ladder_growth_and_gaps();
+    test_price_band_rejects();
     test_modify_loses_priority();
     test_modify_can_cross();
     test_modify_rejects();
