@@ -137,6 +137,12 @@ public:
 
     size_t order_count() const { return index_.size(); }
 
+    // Remaining quantity of a live order, 0 if it is not on the book.
+    Qty leaves(OrderId id) const {
+        uint32_t o = index_.find(id);
+        return o == IdIndex::kMissing ? 0 : pool_[o].qty;
+    }
+
     // Up to n non-empty levels from the best price outward (L2 snapshot).
     std::vector<LevelChange> top(Side side, size_t n) const {
         const Ladder& L = side == Side::Buy ? bids_ : asks_;

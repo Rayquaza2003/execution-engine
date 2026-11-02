@@ -345,7 +345,19 @@ static void test_self_trade_prevention() {
     assert(b.limit(8, Side::Buy, 100, 1, t).status == OrderResult::Filled);
 }
 
+static void test_leaves() {
+    OrderBook b;
+    std::vector<Trade> t;
+    b.limit(1, Side::Sell, 100, 10, t);
+    assert(b.leaves(1) == 10);
+    b.limit(2, Side::Buy, 100, 4, t);
+    assert(b.leaves(1) == 6 && b.leaves(2) == 0);
+    b.cancel(1);
+    assert(b.leaves(1) == 0 && b.leaves(42) == 0);
+}
+
 int main() {
+    test_leaves();
     test_self_trade_prevention();
     test_ioc();
     test_fok();
