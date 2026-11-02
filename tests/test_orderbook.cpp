@@ -320,7 +320,33 @@ static void test_end_of_day_expires_day_orders_only() {
     assert(!b.cancel(1) && b.cancel(2));
 }
 
+static void test_self_trade_prevention() {
+    OrderBook b;
+    std::vector<Trade> t;
+    b.limit(1, Side::Sell, 100, 3, t, Tif::Day, 1);
+    b.limit(2, Side::Sell, 100, 5, t, Tif::Day, 7);  // behind account 1 in the queue
+
+    auto r = b.limit(3, Side::Buy, 100, 10, t, Tif::Day, 7);
+    assert(r.status == OrderResult::Cancelled && r.reason == Reject::SelfTrade && r.filled == 3);
+    assert(t.size() == 1 && t[0].sell_id == 1);
+    assert(b.depth(Side::Sell, 100) == 5 && !b.best_bid());  // own order untouched, nothing rests
+
+    t.clear();
+    r = b.market(4, Side::Buy, 5, t, 7);
+    assert(r.reason == Reject::SelfTrade && r.filled == 0 && t.empty());
+
+    r = b.limit(5, Side::Buy, 100, 5, t, Tif::Fok, 7);  // own order in the way: FOK can't complete
+    assert(r.status == OrderResult::Cancelled && t.empty());
+
+    r = b.limit(6, Side::Buy, 100, 5, t, Tif::Day, 9);  // other account trades normally
+    assert(r.status == OrderResult::Filled && t.size() == 1 && t[0].sell_id == 2);
+
+    b.limit(7, Side::Sell, 100, 1, t);  // account 0 never triggers STP
+    assert(b.limit(8, Side::Buy, 100, 1, t).status == OrderResult::Filled);
+}
+
 int main() {
+    test_self_trade_prevention();
     test_ioc();
     test_fok();
     test_end_of_day_expires_day_orders_only();

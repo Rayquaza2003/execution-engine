@@ -6,6 +6,7 @@ using OrderId = uint64_t;
 using Price = int64_t;  // integer ticks, never floating point
 using Qty = uint64_t;
 using Nanos = uint64_t;  // simulated time since session start
+using AccountId = uint32_t;  // 0 = anonymous (no self-trade prevention)
 
 enum class Side : uint8_t { Buy, Sell };
 
@@ -22,4 +23,5 @@ enum class Reject : uint8_t {
     UnknownOrder,   // cancel/replace for an id that is not live
     UnknownSymbol,
     Halted,         // symbol halted by the circuit breaker
+    SelfTrade,      // cancel reason: remainder would have traded with the same account
 };

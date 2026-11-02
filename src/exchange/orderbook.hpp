@@ -27,7 +27,8 @@ struct OrderResult {
         Rejected,   // book untouched; see reason
         Rested,     // some or none filled, remainder rests on the book
         Filled,     // fully executed
-        Cancelled,  // remainder dropped without resting (market, IOC, unfillable FOK)
+        Cancelled,  // remainder dropped without resting (market, IOC, unfillable FOK,
+                    // or self-trade prevention, which sets reason = SelfTrade)
     };
     Status status;
     Reject reason = Reject::None;
@@ -53,28 +54,37 @@ public:
 
     // Rejected (book untouched) on zero qty, a live duplicate id, or a price
     // outside the domain or the band of its own side.
+    //
+    // Self-trade prevention (cancel newest): if the incoming order reaches a
+    // resting order of the same non-zero account, matching stops there and the
+    // incoming remainder is cancelled; the resting order is left alone.
     OrderResult limit(OrderId id, Side side, Price px, Qty qty, std::vector<Trade>& out,
-                      Tif tif = Tif::Day) {
+                      Tif tif = Tif::Day, AccountId account = 0) {
         Ladder& own = side == Side::Buy ? bids_ : asks_;
         Ladder& opp = side == Side::Buy ? asks_ : bids_;
         if (qty == 0) return {OrderResult::Rejected, Reject::ZeroQty};
         if (!price_ok(own, px)) return {OrderResult::Rejected, Reject::PriceBand};
         if (index_.find(id) != IdIndex::kMissing) return {OrderResult::Rejected, Reject::DuplicateId};
-        if (tif == Tif::Fok && !can_fill(opp, side, px, qty)) return {OrderResult::Cancelled};
-        Qty left = match(opp, id, side, px, qty, out);
+        if (tif == Tif::Fok && !can_fill(opp, side, px, qty, account)) return {OrderResult::Cancelled};
+        bool stp = false;
+        Qty left = match(opp, id, side, px, qty, account, stp, out);
         if (!left) return {OrderResult::Filled, Reject::None, qty};
+        if (stp) return {OrderResult::Cancelled, Reject::SelfTrade, qty - left};
         if (tif == Tif::Ioc) return {OrderResult::Cancelled, Reject::None, qty - left};
-        rest(own, id, side, px, left, tif);
+        rest(own, id, side, px, left, tif, account);
         return {OrderResult::Rested, Reject::None, qty - left};
     }
 
     // Fills against whatever is on the book; any remainder is dropped (IOC).
-    OrderResult market(OrderId id, Side side, Qty qty, std::vector<Trade>& out) {
+    OrderResult market(OrderId id, Side side, Qty qty, std::vector<Trade>& out,
+                       AccountId account = 0) {
         if (qty == 0) return {OrderResult::Rejected, Reject::ZeroQty};
+        bool stp = false;
         Qty left = side == Side::Buy
-                       ? match(asks_, id, side, std::numeric_limits<Price>::max(), qty, out)
-                       : match(bids_, id, side, std::numeric_limits<Price>::min(), qty, out);
-        return {left ? OrderResult::Cancelled : OrderResult::Filled, Reject::None, qty - left};
+                       ? match(asks_, id, side, std::numeric_limits<Price>::max(), qty, account, stp, out)
+                       : match(bids_, id, side, std::numeric_limits<Price>::min(), qty, account, stp, out);
+        if (!left) return {OrderResult::Filled, Reject::None, qty};
+        return {OrderResult::Cancelled, stp ? Reject::SelfTrade : Reject::None, qty - left};
     }
 
     bool cancel(OrderId id) {
@@ -94,10 +104,11 @@ public:
         if (qty == 0) return {OrderResult::Rejected, Reject::ZeroQty};
         Side side = pool_[o].side;
         Tif tif = pool_[o].tif;
+        AccountId account = pool_[o].account;
         if (!price_ok(side == Side::Buy ? bids_ : asks_, px))
             return {OrderResult::Rejected, Reject::PriceBand};
         cancel(id);
-        return limit(id, side, px, qty, out, tif);
+        return limit(id, side, px, qty, out, tif, account);
     }
 
     // Session close: removes every resting Day order (Gtc survives) and appends
@@ -151,7 +162,9 @@ private:
         uint32_t prev, next;  // pool indices within the price level
         Side side;
         Tif tif;  // Day or Gtc; Ioc/Fok never rest
+        AccountId account;
     };
+    static_assert(sizeof(Order) == 40, "keep orders small: more per cache line");
 
     struct Level {
         uint32_t head = kNil, tail = kNil;
@@ -223,14 +236,23 @@ private:
         return px > -kMaxAbsPrice && px < kMaxAbsPrice && own.can_hold(px);
     }
 
-    // FOK pre-check: is there at least qty resting at prices that cross px?
-    static bool can_fill(const Ladder& opp, Side side, Price px, Qty qty) {
+    // FOK pre-check: is there at least qty resting at prices that cross px,
+    // ahead of any order that self-trade prevention would stop at?
+    bool can_fill(const Ladder& opp, Side side, Price px, Qty qty, AccountId account) const {
         if (!opp.live) return false;
         Price step = opp.is_bid ? -1 : 1, end = opp.base + Price(opp.levels.size());
         Qty avail = 0;
         for (Price p = opp.best; p >= opp.base && p < end; p += step) {
             if (side == Side::Buy ? p > px : p < px) return false;
-            avail += opp.levels[p - opp.base].qty;
+            const Level& q = opp.levels[p - opp.base];
+            if (!account) {
+                avail += q.qty;
+            } else {
+                for (uint32_t o = q.head; o != kNil && avail < qty; o = pool_[o].next) {
+                    if (pool_[o].account == account) return false;
+                    avail += pool_[o].qty;
+                }
+            }
             if (avail >= qty) return true;
         }
         return false;
@@ -238,14 +260,20 @@ private:
 
     // Fill against the opposite side while it crosses px. Trades print at the
     // resting order's price. Returns the unfilled quantity.
-    Qty match(Ladder& opp, OrderId id, Side side, Price px, Qty qty, std::vector<Trade>& out) {
-        while (qty && opp.live) {
+    // Sets stp when it stopped at a resting order of the same account.
+    Qty match(Ladder& opp, OrderId id, Side side, Price px, Qty qty, AccountId account, bool& stp,
+              std::vector<Trade>& out) {
+        while (qty && opp.live && !stp) {
             Price p = opp.best;
             if (side == Side::Buy ? p > px : p < px) break;
             Level& q = opp.levels[p - opp.base];
             while (qty && q.head != kNil) {
                 uint32_t h = q.head;
                 Order& resting = pool_[h];
+                if (account && resting.account == account) {
+                    stp = true;
+                    break;
+                }
                 Qty n = std::min(qty, resting.qty);
                 out.push_back(side == Side::Buy ? Trade{id, resting.id, p, n}
                                                 : Trade{resting.id, id, p, n});
@@ -264,7 +292,7 @@ private:
         return qty;
     }
 
-    void rest(Ladder& own, OrderId id, Side side, Price px, Qty qty, Tif tif) {
+    void rest(Ladder& own, OrderId id, Side side, Price px, Qty qty, Tif tif, AccountId account) {
         uint32_t o;
         if (free_.empty()) {
             o = uint32_t(pool_.size());
@@ -275,7 +303,7 @@ private:
         }
         Level& q = own.at(px);
         if (q.head == kNil) own.filled(px);
-        pool_[o] = {id, px, qty, q.tail, kNil, side, tif};
+        pool_[o] = {id, px, qty, q.tail, kNil, side, tif, account};
         if (q.tail != kNil) pool_[q.tail].next = o;
         else q.head = o;
         q.tail = o;
