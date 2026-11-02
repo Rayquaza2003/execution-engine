@@ -108,7 +108,10 @@ public:
     // Accepted price domain; keeps every price difference inside int64.
     static constexpr Price kMaxAbsPrice = Price(1) << 62;
 
-    explicit OrderBook(size_t capacity = 1 << 16) : index_(capacity) { pool_.reserve(capacity); }
+    explicit OrderBook(size_t capacity = 1 << 16) : index_(capacity) {
+        pool_.reserve(capacity);
+        free_.reserve(capacity);
+    }
 
     // Returns false (rejected, book untouched) on zero qty, a live duplicate id,
     // or a price outside the domain or the band of its own side.
