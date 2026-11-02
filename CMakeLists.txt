@@ -17,4 +17,5 @@ set(CMAKE_EXE_LINKER_FLAGS_DEBUG "-fsanitize=address,undefined")
 include_directories(src)
 
 add_executable(test_orderbook tests/test_orderbook.cpp)
+add_executable(test_id_index tests/test_id_index.cpp)
 add_executable(bench_book bench/bench_book.cpp)
