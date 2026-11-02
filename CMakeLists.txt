@@ -15,3 +15,4 @@ set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g -fsanitize=address,undefined -fno-omit-frame-p
 set(CMAKE_EXE_LINKER_FLAGS_DEBUG "-fsanitize=address,undefined")
 
 add_executable(tests test.cpp)
+add_executable(bench bench.cpp)
