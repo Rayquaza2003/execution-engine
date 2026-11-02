@@ -1,5 +1,5 @@
 // Replays a deterministic synthetic order flow through the book.
-// Usage: ./bench [num_ops]   (default 10M)
+// Usage: ./build/bench_book [num_ops]   (default 10M)
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -7,7 +7,7 @@
 #include <new>
 #include <random>
 
-#include "orderbook.hpp"
+#include "exchange/orderbook.hpp"
 
 using Clock = std::chrono::steady_clock;
 

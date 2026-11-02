@@ -1,6 +1,6 @@
 # Benchmarks
 
-Run: `cmake --build build && ./build/bench` (10M ops, fixed seed 42, first 10k ops are untimed warmup).
+Run: `cmake --build build && ./build/bench_book` (10M ops, fixed seed 42, first 10k ops are untimed warmup).
 
 Workload after warmup: 45% limit, 45% cancel, 5% modify, 5% market. Prices 0-40 ticks
 behind a slowly walking mid, ~7% of limits cross. The book stays around 5-7k resting orders.
