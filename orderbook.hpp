@@ -1,6 +1,8 @@
 #pragma once
+#include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <list>
 #include <map>
 #include <optional>
@@ -40,6 +42,12 @@ public:
             if (qty) rest(asks_, id, side, px, qty);
         }
         return true;
+    }
+
+    // Fills against whatever is on the book; any remainder is dropped (IOC).
+    void market(OrderId id, Side side, Qty qty, std::vector<Trade>& out) {
+        if (side == Side::Buy) match(asks_, id, side, std::numeric_limits<Price>::max(), qty, out);
+        else match(bids_, id, side, std::numeric_limits<Price>::min(), qty, out);
     }
 
     std::optional<Price> best_bid() const { return best(bids_); }

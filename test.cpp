@@ -79,7 +79,25 @@ static void test_sell_aggressor_hits_highest_bid() {
     assert(!b.best_ask());
 }
 
+static void test_market_order_sweeps_and_drops_remainder() {
+    OrderBook b;
+    std::vector<Trade> t;
+    b.limit(1, Side::Sell, 100, 2, t);
+    b.limit(2, Side::Sell, 500, 3, t);
+    b.market(3, Side::Buy, 10, t);
+
+    assert(t.size() == 2);
+    assert(t[0].price == 100 && t[1].price == 500);
+    assert(!b.best_ask() && !b.best_bid());  // remainder 5 does not rest
+    assert(b.order_count() == 0);
+
+    t.clear();
+    b.market(4, Side::Sell, 5, t);  // empty book: no-op
+    assert(t.empty());
+}
+
 int main() {
+    test_market_order_sweeps_and_drops_remainder();
     test_resting_orders();
     test_crossing_limit_partial_fill();
     test_time_priority_within_level();
