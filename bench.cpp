@@ -112,6 +112,19 @@ int main(int argc, char** argv) {
 
     // Latency pass: same ops, fresh book, each op bracketed by clock reads.
     // Kept separate so clock overhead does not pollute the throughput number.
+    // Empty bracket = clock read cost + tick size; subtract mentally from the
+    // table. On Apple Silicon the counter ticks at 24 MHz (41.67 ns steps).
+    std::vector<uint32_t> overhead;
+    overhead.reserve(1'000'000);
+    for (int i = 0; i < 1'000'000; ++i) {
+        auto a = Clock::now();
+        auto b = Clock::now();
+        overhead.push_back(uint32_t(std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count()));
+    }
+    uint32_t tick = UINT32_MAX;
+    for (uint32_t v : overhead) if (v) tick = std::min(tick, v);
+    std::printf("clock tick %u ns\n", tick);
+
     std::vector<uint32_t> lat[4];
     size_t counts[4] = {};
     for (size_t i = kWarmup; i < n; ++i) ++counts[size_t(ops[i].type)];
@@ -137,4 +150,5 @@ int main(int argc, char** argv) {
     for (int k = 0; k < 4; ++k) all.insert(all.end(), lat[k].begin(), lat[k].end());
     for (int k = 0; k < 4; ++k) print_percentiles(names[k], lat[k]);
     print_percentiles("all", all);
+    print_percentiles("clock", overhead);
 }
