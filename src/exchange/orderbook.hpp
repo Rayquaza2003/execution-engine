@@ -6,11 +6,7 @@
 #include <optional>
 #include <vector>
 
-using OrderId = uint64_t;
-using Price = int64_t;  // integer ticks, never floating point
-using Qty = uint64_t;
-
-enum class Side : uint8_t { Buy, Sell };
+#include "core/types.hpp"
 
 struct Trade {
     OrderId buy_id;
