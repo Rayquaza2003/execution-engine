@@ -182,8 +182,10 @@ private:
 
 // Synthetic feed for tests and benches: `symbols` stocks named SYM0, SYM1...
 // (locates 1..symbols) and n book messages. Buys rest below a fixed $100 mid
-// and sells above it, so the book never crosses. Mix: 45% add, 25% delete,
-// 10% partial cancel, 10% execute, 10% replace.
+// and sells above it, so the book never crosses. Mix: 40% add, 35% delete,
+// 10% partial cancel, 10% execute (half of them fill the order completely),
+// 5% replace. Adds run hotter below 1000 resting orders per symbol, so the
+// book settles around that size.
 inline void synthetic(Writer& w, size_t n, size_t symbols, uint64_t seed) {
     std::mt19937_64 rng(seed);
     struct Live {
@@ -203,7 +205,7 @@ inline void synthetic(Writer& w, size_t n, size_t symbols, uint64_t seed) {
     for (size_t i = 0; i < n; ++i) {
         ts += rng() % 2000;
         int k = int(rng() % 100);
-        if (live.empty() || k < 45) {
+        if (live.empty() || k < (live.size() < 1000 * symbols ? 50 : 40)) {  // hold ~1000 resting orders per symbol
             Live o{next_ref++, uint16_t(1 + rng() % symbols), rng() % 2 ? Side::Buy : Side::Sell,
                    uint32_t(100 * (1 + rng() % 5))};
             w.add(o.locate, ts, o.ref, o.side, o.shares, "SYM", price(o.side));
@@ -213,12 +215,13 @@ inline void synthetic(Writer& w, size_t n, size_t symbols, uint64_t seed) {
         size_t j = rng() % live.size();
         Live& o = live[j];
         uint32_t part = uint32_t(1 + rng() % o.shares);
-        if (k < 70) {
+        if (k < 75) {
             w.del(o.locate, ts, o.ref);
             part = o.shares;
-        } else if (k < 80) {
+        } else if (k < 85) {
             w.cancel(o.locate, ts, o.ref, part);
-        } else if (k < 90) {
+        } else if (k < 95) {
+            if (k < 90) part = o.shares;
             w.execute(o.locate, ts, o.ref, part, i);
         } else {
             uint64_t ref = next_ref++;
