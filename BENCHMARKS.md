@@ -289,3 +289,45 @@ release store in the queue was weakened to relaxed. TSan then reports a data rac
 `try_pop`.
 
 The order book checksum is still `2a79b8de12e4cd7d`.
+
+## S10: FIX gateway over TCP
+
+`fix_gateway` and `fix_client` talk over loopback on the same M1. The client runs one FIX
+session. Its requests are a mix:
+
+- 70% new limit orders: 100 shares, a random side, within 5 cents of $100.00, so many of them
+  cross. A run of 100k requests gets about 44k fill reports, both sides of each trade
+  included.
+- 30% cancels of an order it believes is resting.
+
+Wire to wire means from the client's `write()` of a request to its `read()` of the first reply
+to that request. The gateway also times itself, from receiving an order to writing that order's
+first execution report. That covers its own read, FIX parse, the matching engine (on another
+thread, through the SPSC queues), the FIX encode and the write.
+
+These are 3 runs of each. The ranges are across runs.
+
+| | p50 | p90 | p99 | p99.9 | throughput |
+|---|---|---|---|---|---|
+| bare TCP echo, 150 B (`bench_tcp`) | 29.7 µs | 36.9 µs | 66 to 78 µs | 102 to 131 µs | |
+| FIX wire to wire, 1 in flight | 31.7 to 34.8 µs | 43 to 57 µs | 78 to 115 µs | 139 to 410 µs | 21 to 25k requests/s |
+| inside the gateway, 1 in flight | 9.2 to 10.2 µs | 16 to 22 µs | 37 to 55 µs | 82 to 172 µs | |
+| FIX wire to wire, 64 in flight | 279 to 328 µs | 0.49 to 0.59 ms | 0.85 to 1.0 ms | 3.4 to 3.8 ms | 134 to 147k requests/s |
+
+**The kernel dominates.** A bare TCP echo over loopback already takes 29.7 µs on macOS. FIX
+parsing, sessions, matching and encoding add 2 to 5 µs on top of that at the median.
+
+**One poll pass, not two.** The first version took 49 µs at the median and handled 33k
+requests/s with 64 in flight. Profiling showed its loop sat in `poll()`. A report the matcher
+produced a moment after the read waited a whole extra `poll()` syscall. Now every request is
+counted until the matcher answers it, and the gateway spins on the queue for those answers
+before polling again. That brought the median to 33 µs and throughput to 134k+ requests/s.
+
+**Rejects are real races.** With 1 in flight, about 600 of 100k requests are rejected. These
+are cancels that arrive after the order has already filled, which is correct FIX behaviour.
+A bug had turned them into endless retries: the OrderCancelReject reported OrdStatus 1, so
+the client thought the order was still live. The gateway now tracks when an order is done.
+
+With 64 in flight, the latency is mostly queueing behind the 63 requests ahead.
+
+The order book checksum is still `2a79b8de12e4cd7d`.
