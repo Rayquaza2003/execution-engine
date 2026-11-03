@@ -220,3 +220,72 @@ the front of the best level. The order book checksum is still `2a79b8de12e4cd7d`
 our symbols goes to every venue, and only the venue that holds the order changes its book.
 It runs 395 parents in each of 4 modes. The whole run takes 1.97 s (3 runs, all 1.97 s),
 about 0.49 s per mode. Two runs give byte-identical CSVs. Results are in `research/README.md`.
+
+## S9: threads, queues, logger
+
+macOS can't pin a thread to a core. Threads ask for the performance cores through the highest
+QoS class, and the scheduler places them. The clock ticks every 41.67 ns, so single-hop
+numbers near 200 ns are within a few clock ticks. Pinned, isolated cores on Linux are still to
+do.
+
+### Lock-free SPSC queue vs a mutex around a deque (`bench_spsc`)
+
+Both queues have the same interface and a capacity of 4096. Throughput is 20M messages, median
+of 5 runs. The round trip has one message in flight: thread A sends a timestamp and thread B
+echoes it back on a second queue. That is 200k round trips, and the median run is shown.
+
+| | throughput | round trip p50 | p99 | p99.9 |
+|---|---|---|---|---|
+| SPSC | 22.1 M msgs/s (18.1 to 30.9) | 215 ns | 255 ns | 335 ns |
+| mutex | 13.3 M msgs/s (8.9 to 15.8) | 16.4 µs | 147 µs | 524 µs |
+
+Throughput depends on where the scheduler puts the two threads. One earlier run gave
+28.8 vs 16.1 M msgs/s.
+
+### Async logger
+
+`log()` costs 34 ns per call on the hot path. Formatting the same line with `fprintf` to
+`/dev/null` costs 270 ns. That is 50 batches of 8192 calls, each batch small enough to fit
+the ring so nothing is dropped.
+
+### Pipeline (`bench_pipeline`, real ITCH, 5 symbols, 725k messages)
+
+The run has four threads: feed, venue, market data, and strategy with OMS and risk. Five SPSC
+queues connect them, and no other memory is shared. The strategy keeps one order at the bid
+and one at the ask per symbol, and replaces them as the touch moves.
+
+The table shows 3 runs of each mode:
+
+| | throughput | tick-to-order p50 | p99 |
+|---|---|---|---|
+| one thread, no queues | 3.85 to 4.20 M msgs/s | 431 ns | 3.3 µs |
+| pipeline, flat out | 3.0 to 4.3 M msgs/s | queue-bound | queue-bound |
+| pipeline, paced at 250k msgs/s | n/a | 1.5 µs | about 1 ms |
+
+**Throughput.** The pipeline gains no throughput: the venue stage is the bottleneck, and
+splitting the other stages off doesn't speed it up.
+
+**Hops.** Paced, each hop (enqueue to dequeue) takes 215 to 300 ns at p50 and about 0.5 to
+1 µs at p99. The three hops a quote crosses add about 1 µs to tick-to-order.
+
+**Tails come from the OS.** With four busy-spinning threads on four performance cores,
+another process sometimes preempts a spinner. That gives the p99 of about 1 ms. Two waiting
+strategies were measured:
+
+- Yielding to the OS when idle made tick-to-order p99 about 60 to 100 ms in paced runs, so it
+  was dropped. On macOS, a thread that yields gets parked.
+- Busy-spinning with the CPU's spin hint (`yield` on ARM) doubled flat-out throughput compared
+  with a bare spin, 1.2 to 2.5 M msgs/s on the synthetic feed.
+
+**Synthetic feed.** Executions hit random queue positions instead of the front, so
+`fill_ahead` walks deep queues. That makes the synthetic feed a poor yardstick here, so the
+pipeline is measured on the real file.
+
+### ThreadSanitizer
+
+`cmake -B build-tsan -DCMAKE_BUILD_TYPE=Tsan`. All 19 test suites pass under TSan, and so does
+the full `bench_pipeline` run on the real file. To check that the test catches a real bug, one
+release store in the queue was weakened to relaxed. TSan then reports a data race in
+`try_pop`.
+
+The order book checksum is still `2a79b8de12e4cd7d`.
