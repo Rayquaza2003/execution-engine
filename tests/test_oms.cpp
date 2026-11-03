@@ -197,6 +197,64 @@ static void test_invalid_venue_message_is_counted_not_applied() {
     assert(r.oms.invalid_transitions() == 1 && r.o(1).state == S::Acknowledged && r.o(1).leaves == 10);
 }
 
+// Races: the OMS has sent a request (queued in req, not yet at the venue)
+// while a fill is already happening at the venue.
+
+static void test_race_cancel_loses_to_full_fill() {
+    Rig r;
+    r.oms.submit(r.lim(1, Side::Buy, 100, 10), r.req);
+    r.send();
+    r.oms.cancel(1, r.req);           // cancel on the wire...
+    r.other(1, Side::Sell, 100, 10);  // ...while the order fills
+    assert(r.o(1).state == S::Filled && r.o(1).cum == 10);
+    r.send();                         // venue: too late, CancelRejected
+    assert(r.o(1).state == S::Filled && r.o(1).last_reject == Reject::UnknownOrder);
+    assert(r.oms.invalid_transitions() == 0);
+}
+
+static void test_race_partial_fill_then_cancel() {
+    Rig r;
+    r.oms.submit(r.lim(1, Side::Buy, 100, 10), r.req);
+    r.send();
+    r.oms.cancel(1, r.req);
+    r.other(1, Side::Sell, 100, 4);
+    assert(r.o(1).state == S::CancelPending && r.o(1).cum == 4 && r.o(1).leaves == 6);
+    r.send();
+    assert(r.o(1).state == S::Cancelled && r.o(1).cum == 4 && r.o(1).leaves == 0);
+}
+
+static void test_race_replace_loses_to_full_fill() {
+    Rig r;
+    r.oms.submit(r.lim(1, Side::Buy, 100, 10), r.req);
+    r.send();
+    r.oms.replace(1, 99, 10, r.req);
+    r.other(1, Side::Sell, 100, 10);
+    assert(r.o(1).state == S::Filled);
+    r.send();
+    assert(r.o(1).state == S::Filled && r.o(1).px == 100 && r.oms.invalid_transitions() == 0);
+}
+
+static void test_race_replace_after_partial_fill() {
+    Rig r;
+    r.oms.submit(r.lim(1, Side::Buy, 100, 10), r.req);
+    r.send();
+    r.oms.replace(1, 100, 8, r.req);
+    r.other(1, Side::Sell, 100, 4);
+    assert(r.o(1).state == S::ReplacePending && r.o(1).cum == 4);
+    r.send();
+    // Replace sets the new open quantity, so 8 more can fill on top of the 4.
+    assert(r.o(1).state == S::PartiallyFilled && r.o(1).leaves == 8 && r.o(1).cum == 4);
+}
+
+static void test_race_cancel_before_ack() {
+    Rig r;
+    r.oms.submit(r.lim(1, Side::Buy, 100, 10), r.req);
+    assert(r.oms.cancel(1, r.req) && r.req.size() == 2);  // both on the wire, unacked
+    r.send();                                             // New arrives while CancelPending
+    assert(r.o(1).state == S::Cancelled && r.oms.invalid_transitions() == 0);
+    assert(r.v.book(r.s).order_count() == 0);
+}
+
 static_assert(transition(OrdState::CancelPending, OrdEvent::Fill, true) == OrdState::Filled,
               "a fill in flight beats the cancel");
 
@@ -209,5 +267,10 @@ int main() {
     test_replace_and_replace_reject_restores();
     test_ioc_reject_and_stop_paths();
     test_invalid_venue_message_is_counted_not_applied();
+    test_race_cancel_loses_to_full_fill();
+    test_race_partial_fill_then_cancel();
+    test_race_replace_loses_to_full_fill();
+    test_race_replace_after_partial_fill();
+    test_race_cancel_before_ack();
     std::puts("all tests passed");
 }
