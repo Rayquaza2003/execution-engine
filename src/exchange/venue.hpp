@@ -3,6 +3,7 @@
 #include <functional>
 #include <map>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 #include "core/ring.hpp"
@@ -45,6 +46,9 @@ struct ReplaceRequest {
     Price px;
     Qty qty;
 };
+
+// Anything a client can send to the venue, as one value for queues and the event loop.
+using VenueRequest = std::variant<NewOrder, CancelRequest, ReplaceRequest>;
 
 enum class ExecType : uint8_t {
     New,              // accepted
@@ -124,6 +128,12 @@ public:
     const OrderBook& book(SymbolId sym) const { return books_[sym]; }
     const TradeHistory& trades(SymbolId sym) const { return syms_[sym].recent; }
     size_t symbols() const { return books_.size(); }
+
+    void on_request(const VenueRequest& rq, VenueOut& out) {
+        if (auto* n = std::get_if<NewOrder>(&rq)) on_new(*n, out);
+        else if (auto* c = std::get_if<CancelRequest>(&rq)) on_cancel(*c, out);
+        else on_replace(std::get<ReplaceRequest>(rq), out);
+    }
 
     void on_new(const NewOrder& o, VenueOut& out) {
         if (o.sym >= books_.size()) return report(out, o.id, o.sym, ExecType::Rejected, Reject::UnknownSymbol);

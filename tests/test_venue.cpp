@@ -296,7 +296,18 @@ static void test_trade_history() {
     assert(h.newest().price == 100 + 1499 % 7 && h[0].price == 100 + (1500 - 1024) % 7);
 }
 
+static void test_on_request_dispatch() {
+    Venue v;
+    VenueOut o;
+    SymbolId s = v.add_symbol();
+    v.on_request(lim(1, s, Side::Buy, 100, 5), o);
+    v.on_request(ReplaceRequest{1, s, 101, 4}, o);
+    v.on_request(CancelRequest{1, s}, o);
+    assert((types(o) == std::vector<E>{E::New, E::Replaced, E::Cancelled}));
+}
+
 int main() {
+    test_on_request_dispatch();
     test_trade_history();
     test_breaker_off_by_default();
     test_breaker_halts_and_resumes();
