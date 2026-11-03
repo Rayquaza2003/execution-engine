@@ -13,12 +13,15 @@ add_compile_options(-Wall -Wextra -Wpedantic)
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -DNDEBUG -g")
 set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g -fsanitize=address,undefined -fno-omit-frame-pointer")
 set(CMAKE_EXE_LINKER_FLAGS_DEBUG "-fsanitize=address,undefined")
+# ThreadSanitizer: cmake -B build-tsan -DCMAKE_BUILD_TYPE=Tsan
+set(CMAKE_CXX_FLAGS_TSAN "-O1 -g -fsanitize=thread -fno-omit-frame-pointer")
+set(CMAKE_EXE_LINKER_FLAGS_TSAN "-fsanitize=thread")
 
 include_directories(src)
 
 enable_testing()
 # One assert-based executable per module: tests/test_<name>.cpp
-foreach(name orderbook id_index event_loop ring venue oms risk itch replay md fill_study fill_table tca algos router sor_sim)
+foreach(name orderbook id_index event_loop ring venue oms risk itch replay md fill_study fill_table tca algos router sor_sim spsc)
   add_executable(test_${name} tests/test_${name}.cpp)
   add_test(NAME ${name} COMMAND test_${name})
 endforeach()
