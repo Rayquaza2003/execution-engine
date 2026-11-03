@@ -189,3 +189,15 @@ and the final books came out identical. The timing difference was 0.74 vs 0.61 s
 were single noisy runs.
 
 The order book checksum is still `2a79b8de12e4cd7d`.
+
+## S6: queue position study
+
+`fill_study` runs on the same 751 MB file with the same 5 symbols. It replays the books and
+places 433k virtual passive orders: a timer join every 100 ms, plus a join at each new best
+level, at six latencies each. It tracks each order's exact queue position and writes one CSV
+row per order.
+
+The run takes 0.79 s (median of 5 runs, 0.76 to 0.94 s). The plain replay in `itch_replay`
+takes 0.61 s, so the study adds about 0.2 s. Results are in `research/README.md`.
+
+The order book checksum is still `2a79b8de12e4cd7d`. The book only gained const accessors.

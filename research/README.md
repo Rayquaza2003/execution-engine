@@ -34,7 +34,7 @@ for the exact rules.
 - NASDAQ TotalView-ITCH 5.0, 2019-01-30, the first 751 MB (to about 09:38).
 - 22.4 M messages, AAPL MSFT SPY QQQ TSLA.
 - 433k virtual orders.
-- The replay plus the study takes 0.96 s on an M-series laptop.
+- The replay plus the study takes 0.79 s on an Apple M1 (median of 5 runs).
 - This is the first eight minutes of the session, the busiest stretch, so the
   numbers describe the open, not a whole day.
 
