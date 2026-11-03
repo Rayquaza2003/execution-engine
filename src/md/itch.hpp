@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <random>
 #include <string>
@@ -107,6 +108,22 @@ size_t parse(const uint8_t* p, size_t n, F&& f) {
         }
     }
     return at;
+}
+
+// Parses a whole file in chunks; returns the bytes read.
+template <class F>
+size_t parse_file(std::FILE* in, F&& f) {
+    std::vector<uint8_t> buf(1 << 24);
+    size_t have = 0, bytes = 0;
+    for (;;) {
+        size_t got = std::fread(buf.data() + have, 1, buf.size() - have, in);
+        have += got;
+        bytes += got;
+        size_t used = parse(buf.data(), have, f);
+        std::memmove(buf.data(), buf.data() + used, have - used);
+        have -= used;
+        if (!got) return bytes;
+    }
 }
 
 // Encoder for tests, benches and synthetic feeds. Fields we don't parse are zero.

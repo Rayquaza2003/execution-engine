@@ -4,7 +4,6 @@
 // Sample days: https://emi.nasdaq.com/ITCH/Nasdaq%20ITCH/ (gunzip first).
 #include <chrono>
 #include <cstdio>
-#include <cstring>
 #include <string>
 #include <vector>
 
@@ -52,17 +51,7 @@ int main(int argc, char** argv) {
     };
 
     auto t0 = std::chrono::steady_clock::now();
-    std::vector<uint8_t> buf(1 << 24);
-    size_t have = 0, bytes = 0;
-    for (;;) {
-        size_t got = std::fread(buf.data() + have, 1, buf.size() - have, in);
-        have += got;
-        bytes += got;
-        size_t used = itch::parse(buf.data(), have, on_msg);
-        std::memmove(buf.data(), buf.data() + used, have - used);
-        have -= used;
-        if (!got) break;
-    }
+    size_t bytes = itch::parse_file(in, on_msg);
     ms.finish(bars);
     write();
     double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
