@@ -269,6 +269,10 @@ public:
         return slot == IdIndex::kMissing ? nullptr : &orders_[slot];
     }
 
+    // By venue order id, for reports; nullptr if it isn't one of ours.
+    const OmsOrder* by_id(OrderId id) const {
+        return id >= base_ && id - base_ < orders_.size() ? &orders_[id - base_] : nullptr;
+    }
     const std::vector<OmsFill>& fills() const { return fills_; }
     size_t order_count() const { return orders_.size(); }
     size_t invalid_transitions() const { return invalid_; }  // venue messages the state machine refused

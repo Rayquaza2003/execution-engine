@@ -131,6 +131,7 @@ static void test_lifecycle_new_partial_full() {
     r.other(2, Side::Sell, 99, 6);  // prints at our resting 100
     assert(r.o(1).state == S::Filled && r.o(1).cum == 10 && r.o(1).leaves == 0);
     assert(r.o(1).avg_px() == 100.0);
+    assert(r.oms.by_id(r.o(1).id) == &r.o(1) && !r.oms.by_id(1) && !r.oms.by_id(r.o(1).id + 1));
 
     const auto& f = r.oms.fills();
     assert(f.size() == 2 && f[0].qty == 4 && f[1].qty == 6 && f[0].time == 500 && f[0].cl == 1);
