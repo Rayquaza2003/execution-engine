@@ -83,8 +83,17 @@ public:
                 }
                 c->s.on_bytes(buf, size_t(n), t, [&](const fix::Message& m) { on_app(uint32_t(i - 1), m, t); });
             }
+            // Every request gets an answer from the matcher within a microsecond
+            // or so: wait for them here rather than going round poll() again.
             FromVenue r;
-            while (from_venue_.try_pop(r)) on_report(r.rep, now());
+            while (inflight_ || from_venue_.try_pop(r)) {
+                if (inflight_ && !from_venue_.try_pop(r)) {
+                    cpu_relax();
+                    continue;
+                }
+                inflight_ -= r.last;
+                if (r.has_rep) on_report(r.rep, now());
+            }
             if (t >= next_timer) {
                 for (size_t i = 0; i < conns_.size(); ++i)
                     if (conns_[i] && !conns_[i]->s.on_timer(t)) drop(i);
@@ -121,12 +130,15 @@ private:
         Price pending_px = 0;
         Qty pending_qty = 0;
         Nanos received = 0;  // until its first report goes out
+        bool done = false;   // filled, cancelled, rejected or expired
     };
     struct ToVenue {
         VenueRequest rq;
     };
     struct FromVenue {
         ExecReport rep;
+        bool has_rep;  // false: the request produced no report (marker only)
+        bool last;     // the last report for one request
     };
 
     static void nonblocking(int fd) { fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK); }
@@ -176,8 +188,11 @@ private:
             }
             venue.set_time(now());
             venue.on_request(r.rq, out);
-            for (const ExecReport& e : out.reports)
-                while (!from_venue_.try_push({e})) cpu_relax();
+            if (out.reports.empty()) out.reports.push_back({});  // still close the request
+            for (size_t i = 0; i < out.reports.size(); ++i) {
+                FromVenue f{out.reports[i], i + 1 < out.reports.size() || out.reports[i].id, i + 1 == out.reports.size()};
+                while (!from_venue_.try_push(f)) cpu_relax();
+            }
             out.clear();
         }
     }
@@ -190,6 +205,7 @@ private:
 
     void submit(const VenueRequest& rq) {
         while (!to_venue_.try_push({rq})) cpu_relax();
+        ++inflight_;
     }
 
     void on_app(uint32_t ci, const fix::Message& m, Nanos t) {
@@ -220,7 +236,8 @@ private:
             orders_.push_back({ci, cl, "", *sym, s, Qty(*qty), 0, 0, 0, 0, t});
             c.by_cl[cl] = id;
             OrdType ot = ord == "1" ? OrdType::Market : OrdType::Limit;
-            submit(NewOrder{id, ci + 1, *sym, s, ot, ot == OrdType::Market ? Tif::Ioc : tif, px.value_or(0), Qty(*qty)});
+            // Account 0: no self-trade prevention (opt-in per order on real venues; not wired to FIX here).
+            submit(NewOrder{id, 0, *sym, s, ot, ot == OrdType::Market ? Tif::Ioc : tif, px.value_or(0), Qty(*qty)});
             return;
         }
         if (type != "F" && type != "G") return;  // ponytail: other app messages ignored, not rejected
@@ -263,6 +280,8 @@ private:
     }
 
     static char status(const Ord& o, Qty leaves) { return !leaves && o.cum ? '2' : o.cum ? '1' : '0'; }
+    // OrdStatus as far as the gateway knows, for a cancel/replace reject.
+    static char status(const Ord& o) { return !o.done ? (o.cum ? '1' : '0') : o.cum >= o.qty ? '2' : '4'; }
 
     void on_report(const ExecReport& r, Nanos t) {
         Ord& o = orders_[r.id - 1];
@@ -271,10 +290,12 @@ private:
             o.cum += r.last_qty;
             o.notional += double(r.last_px) * double(r.last_qty);
         }
+        o.done |= (r.type == ExecType::Trade && !r.leaves) || r.type == ExecType::Cancelled ||
+                  r.type == ExecType::Rejected || r.type == ExecType::Expired;
         if (!c) return;  // the client is gone; its order still trades
         if (r.type == ExecType::CancelRejected || r.type == ExecType::ReplaceRejected) {
-            cancel_reject(*c, o.pending_cl, o.cl, r.type == ExecType::ReplaceRejected, "rejected by venue", t,
-                          status(o, 1));
+            cancel_reject(*c, o.pending_cl, o.cl, r.type == ExecType::ReplaceRejected,
+                          o.done ? "order already done" : "rejected by venue", t, status(o));
             o.pending_cl.clear();
             return;
         }
@@ -320,6 +341,7 @@ private:
     std::vector<std::unique_ptr<Conn>> conns_;  // by connection number; null once closed
     std::vector<Ord> orders_;                   // by OrderId - 1
     uint64_t exec_id_ = 0;
+    size_t inflight_ = 0;  // requests sent to the matcher, not yet fully answered
     Spsc<ToVenue, 1 << 16> to_venue_;
     Spsc<FromVenue, 1 << 16> from_venue_;
     Histogram in_to_out_;

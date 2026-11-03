@@ -113,7 +113,8 @@ static void test_orders_over_tcp() {
 
         buyer.cancel("b4", "b3");  // already cancelled: the venue refuses
         f = buyer.expect("b4");
-        assert(f[fix::MsgType] == "9" && f[fix::CxlRejResponseTo] == "1");
+        assert(f[fix::MsgType] == "9" && f[fix::CxlRejResponseTo] == "1" && f[fix::OrdStatus] == "4");
+        assert(f[fix::Text] == "order already done");
 
         buyer.order("b5", '1', "10", "10.00", "TSLA");
         f = buyer.expect("b5");
