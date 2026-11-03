@@ -24,4 +24,13 @@ enum class Reject : uint8_t {
     UnknownSymbol,
     Halted,         // symbol halted by the circuit breaker
     SelfTrade,      // cancel reason: remainder would have traded with the same account
+    // Pre-trade risk (the firm's own checks; the order never reaches the venue)
+    KillSwitch,
+    MaxOrderQty,
+    MaxNotional,
+    MaxPosition,       // worst case: position plus every open order on that side
+    MaxOpenOrders,
+    FatFinger,         // limit price too far from the mark
+    LossLimit,         // mark-to-market PnL at or below the loss limit
+    NoReferencePrice,  // no mark yet for the symbol, so price checks can't run
 };
