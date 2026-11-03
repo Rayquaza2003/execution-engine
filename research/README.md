@@ -100,3 +100,112 @@ empty `queue_hi` means the bucket has no upper bound.
 - **End of data:** orders still open when the data ends are dropped. There
   are 3.3k of them, below 1%.
 - **Coverage:** the results come from one morning and five symbols.
+
+## Execution algos and TCA (S7)
+
+```
+./build/algo_compare 01302019.NASDAQ_ITCH50 research/fill_prob.csv algos.csv AAPL MSFT SPY QQQ TSLA
+python3 research/algo_compare.py algos.csv
+```
+
+Six algos work the same parent orders. Each algo sends its child orders
+through the OMS and the risk check, with 100 us of latency each way. The
+child orders rest in the replayed books next to the real orders:
+
+- **Resting children:** they fill when real executions reach them in the
+  queue, or when the market trades through their price
+  (`Venue::replay_execute`).
+- **Crossing children:** they are IOCs at the far touch, and they take real
+  liquidity off the book.
+
+### The parent orders
+
+- One parent per symbol starts every 10 s from 09:30:30 to 09:36:00, 34
+  starts in all.
+- Each parent lasts 1 minute. Buys and sells alternate.
+- Each is sized at 5% of the volume in the minute before it. The median is
+  2,100 shares.
+- VWAP's volume curve comes from that same previous minute, so nothing looks
+  ahead.
+- In total there are 170 parents per algo.
+
+Parents that overlap in time would trade against each other's liquidity, so
+each replay runs only every sixth start. That takes 36 replays of the 751 MB
+file, in 14.7 s.
+
+### How each algo works
+
+- Each algo works in 1 s steps.
+- The new part of the schedule rests at the near touch.
+- Any part already due that has not filled is crossed.
+- After the end time, everything left is crossed.
+- Settings:
+  - POV runs at a 10% participation rate.
+  - IS uses urgency kT = 2.
+  - Iceberg shows about 5% of the parent at a time.
+  - Adaptive follows the TWAP schedule. It crosses the whole slice when a
+    hand-set score is positive. The score combines how far behind it is,
+    book imbalance, S6 fill probability, spread and recent volatility.
+
+### Results
+
+Mean cost per algo, in bps of the arrival mid. Positive is a cost. Every
+parent completed, so opportunity cost is 0.
+
+| algo | shortfall | spread | timing | vs VWAP | passive fills | children | duration |
+|---|---|---|---|---|---|---|---|
+| TWAP | 1.12 | 0.83 | 0.29 | 1.42 | 62% | 121 | 60 s |
+| VWAP | 1.29 | 1.01 | 0.28 | 1.56 | 59% | 109 | 60 s |
+| POV | 1.57 | 1.29 | 0.28 | 1.77 | 48% | 50 | 36 s |
+| Iceberg | -0.45 | -1.01 | 0.56 | -0.75 | 99% | 31 | 29 s |
+| IS | 1.12 | 0.85 | 0.27 | 1.39 | 62% | 127 | 60 s |
+| Adaptive | 0.84 | 0.56 | 0.28 | 1.10 | 39% | 77 | 60 s |
+
+The market's own drift over a minute is about 9 bps (the standard deviation
+of shortfall). That is far bigger than any gap between algos. So the useful
+comparison is paired: each algo minus TWAP on the same parent.
+
+| algo | shortfall vs TWAP, bps |
+|---|---|
+| Iceberg | -1.57 ± 0.44 |
+| Adaptive | -0.28 ± 0.10 |
+| IS | 0.00 ± 0.15 |
+| VWAP | +0.17 ± 0.14 |
+| POV | +0.45 ± 0.29 |
+
+![algos](figures/algos.png)
+
+### What the results show
+
+- **Adaptive beats TWAP by 0.28 bps (about 3 standard errors).** All of the
+  gain is in spread cost. The timing difference with TWAP is -0.01 ± 0.08 bps.
+  TWAP crosses whenever it falls behind, whatever the book looks like.
+  Adaptive crosses more often (only 39% of its fills are passive), but it
+  chooses when: tight spreads, and imbalance leaning against it. So each
+  cross is cheaper.
+- **Iceberg is cheapest in this model.** Almost every fill is passive, and
+  it earns about 1 bp of spread. Treat this as an upper bound. Iceberg
+  depends most on the fill model, which is generous to resting orders, as
+  explained under Limits.
+- **IS and VWAP match TWAP.** Over one minute, IS with kT = 2 front-loads
+  only slightly. One minute of history is a noisy volume curve for VWAP.
+- **POV is the most expensive.** At 10% participation it finishes early,
+  in 36 s, and crosses more.
+- **Prices revert after we stop.** The mid comes back about 1.2 bps within
+  10 s of the end for the schedule algos. That is temporary impact, mostly
+  from the final crossing.
+
+### Limits
+
+- **Fill model:** passive fills follow the real queue, but the real market
+  never reacts to our orders. When we fill ahead of a feed order, the feed
+  order still trades in full. In effect the aggressor was that much bigger.
+  This flatters resting orders, which matters most for Iceberg. 5% of the
+  flow is small, but not zero.
+- **Book drift:** our IOCs remove real orders. The feed later cancels or
+  executes orders that are already gone, and the replay drops those
+  messages: 340 to 510 per replay, against 725k messages for these symbols.
+- **Adaptive weights:** they are hand-set, not fitted. Fitting them on one
+  morning and testing on the same morning would overfit. That needs more
+  days of data.
+- **Coverage:** one morning, five symbols, and 1-minute parents.

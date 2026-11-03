@@ -201,3 +201,15 @@ The run takes 0.79 s (median of 5 runs, 0.76 to 0.94 s). The plain replay in `it
 takes 0.61 s, so the study adds about 0.2 s. Results are in `research/README.md`.
 
 The order book checksum is still `2a79b8de12e4cd7d`. The book only gained const accessors.
+
+## S7: execution algos
+
+`algo_compare` replays the same 751 MB file 36 times. That is 6 algos, each run as 6 groups of
+parents that don't overlap. In total it works 170 parent orders per algo through the OMS and
+risk, with 100 us of latency each way. The whole run takes 14.7 s, about 0.41 s per replay.
+The plain replay in S5 took 0.61 s, so the algos and the OMS add little. TCA results are in
+`research/README.md`.
+
+`Venue::replay_execute` now fills our resting orders that rank ahead of a feed execution. The
+code walks from the best price down to the executed order, and executions almost always hit
+the front of the best level. The order book checksum is still `2a79b8de12e4cd7d`.
