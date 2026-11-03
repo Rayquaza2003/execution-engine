@@ -21,7 +21,7 @@ include_directories(src)
 
 enable_testing()
 # One assert-based executable per module: tests/test_<name>.cpp
-foreach(name orderbook id_index event_loop ring venue oms risk itch replay md fill_study fill_table tca algos router sor_sim spsc histogram)
+foreach(name orderbook id_index event_loop ring venue oms risk itch replay md fill_study fill_table tca algos router sor_sim spsc histogram logger)
   add_executable(test_${name} tests/test_${name}.cpp)
   add_test(NAME ${name} COMMAND test_${name})
 endforeach()
@@ -33,3 +33,4 @@ add_executable(bench_md bench/bench_md.cpp)
 add_executable(fill_study tools/fill_study.cpp)
 add_executable(algo_compare tools/algo_compare.cpp)
 add_executable(sor_compare tools/sor_compare.cpp)
+add_executable(bench_spsc bench/bench_spsc.cpp)
