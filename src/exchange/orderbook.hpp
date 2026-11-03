@@ -137,6 +137,43 @@ public:
         return r;
     }
 
+    // Replaying an outside feed with our own orders mixed in. The feed says
+    // resting order `id` traded qty; a real venue would first have reached
+    // any order with an account (ours) that ranks ahead of it: a better price
+    // on the same side, or the same price earlier in the queue. Those fill
+    // first, up to qty in total, at their own prices. Feed orders (account 0)
+    // are untouched; the caller still applies the feed's own execution.
+    // Trades name the feed's anonymous aggressor as id 0.
+    void fill_ahead(OrderId id, Qty qty, std::vector<Trade>& out) {
+        uint32_t f = index_.find(id);
+        if (f == IdIndex::kMissing) return;
+        Side side = pool_[f].side;
+        Price px = pool_[f].price;
+        Ladder& L = side == Side::Buy ? bids_ : asks_;
+        Price step = L.is_bid ? -1 : 1;
+        for (Price p = L.best; qty && (L.is_bid ? p >= px : p <= px); p += step) {
+            Level& q = L.levels[p - L.base];
+            for (uint32_t o = q.head; o != kNil && o != f && qty;) {
+                uint32_t next = pool_[o].next;
+                Order& x = pool_[o];
+                if (x.account) {
+                    Qty n = std::min(qty, x.qty);
+                    out.push_back(side == Side::Buy ? Trade{x.id, 0, p, n} : Trade{0, x.id, p, n});
+                    qty -= n;
+                    if (n == x.qty) {
+                        index_.take(x.id);
+                        remove(L, o);
+                    } else {
+                        x.qty -= n;
+                        q.qty -= n;
+                        changed(side, p, q.qty);
+                    }
+                }
+                o = next;
+            }
+        }
+    }
+
     // Session close: removes every resting Day order (Gtc survives) and appends
     // its id to `expired`.
     void end_of_day(std::vector<OrderId>& expired) {

@@ -306,7 +306,38 @@ static void test_on_request_dispatch() {
     assert((types(o) == std::vector<E>{E::New, E::Replaced, E::Cancelled}));
 }
 
+// Replay with our orders mixed in: a feed execution fills ours first when
+// we rank ahead of the order it names, and never when we are behind it.
+static void test_replay_fills_our_orders_ahead() {
+    Venue v;
+    VenueOut o;
+    SymbolId s = v.add_symbol();
+    v.replay_add(s, 100, Side::Buy, 50, 10, o);                    // feed A
+    v.on_new(lim(1, s, Side::Buy, 50, 4, Tif::Day, 7), o);        // ours, behind A
+    v.replay_add(s, 101, Side::Buy, 50, 10, o);                   // feed B, behind us
+    o.clear();
+
+    v.replay_execute(s, 100, 6, std::nullopt, true, o);  // A is ahead of us: nothing for us
+    assert(o.reports.empty() && o.prints.size() == 1 && v.book(s).leaves(1) == 4);
+    o.clear();
+    v.replay_execute(s, 101, 3, std::nullopt, true, o);  // B is behind us: we fill 3 first
+    assert(o.reports.size() == 1 && o.reports[0].id == 1 && o.reports[0].type == E::Trade);
+    assert(o.reports[0].last_px == 50 && o.reports[0].last_qty == 3 && o.reports[0].leaves == 1);
+    assert(o.prints.size() == 2 && o.prints[0].aggressor == Side::Sell);
+    assert(v.book(s).leaves(101) == 7 && v.book(s).depth(Side::Buy, 50) == 4 + 1 + 7);
+
+    // Trade-through: our better-priced offer fills before a feed offer at a worse price.
+    v.replay_add(s, 102, Side::Sell, 53, 10, o);
+    v.on_new(lim(2, s, Side::Sell, 52, 5, Tif::Day, 7), o);
+    o.clear();
+    v.replay_execute(s, 102, 8, std::nullopt, true, o);
+    assert(o.reports.size() == 1 && o.reports[0].id == 2 && o.reports[0].last_px == 52 &&
+           o.reports[0].last_qty == 5 && o.reports[0].leaves == 0);
+    assert(!v.book(s).leaves(2) && v.book(s).leaves(102) == 2 && *v.book(s).best_ask() == 53);
+}
+
 int main() {
+    test_replay_fills_our_orders_ahead();
     test_on_request_dispatch();
     test_trade_history();
     test_breaker_off_by_default();

@@ -217,8 +217,20 @@ public:
 
     // The feed says a resting order traded. Prints at px, or at the order's
     // own price if px is empty; non-printable executions move the book only.
+    // Our own orders that rank ahead of it fill first (OrderBook::fill_ahead).
+    // ponytail: the feed's order still trades in full, so our fills add to the
+    // printed volume as if the aggressor had been that much bigger; the real
+    // market never reacts to us. Fine while our size is small next to the flow.
     OrderBook::Reduced replay_execute(SymbolId s, OrderId id, Qty qty, std::optional<Price> px,
                                       bool printable, VenueOut& out) {
+        books_[s].fill_ahead(id, qty, trades_);
+        for (const Trade& t : trades_) {
+            bool buy = t.buy_id != 0;
+            OrderId ours = buy ? t.buy_id : t.sell_id;
+            report(out, ours, s, ExecType::Trade, Reject::None, t.price, t.qty, books_[s].leaves(ours));
+            print(s, t.price, t.qty, buy ? Side::Sell : Side::Buy, out);
+        }
+        trades_.clear();
         OrderBook::Reduced r = books_[s].reduce(id, qty);
         if (r.qty && printable)
             print(s, px.value_or(r.price), r.qty, r.side == Side::Buy ? Side::Sell : Side::Buy, out);
