@@ -31,6 +31,7 @@ static void test_each_message_type_moves_the_book() {
     VenueOut out;
     assert(r.feed(w.buf.data(), w.buf.size(), out) == w.buf.size());
     assert(v.symbols() == 1 && r.symbol("AAPL") == 0u && !r.symbol("MSFT") && r.name(0) == "AAPL");
+    assert(r.symbol_at(5) == 0u && !r.symbol_at(6));
     const OrderBook& b = v.book(0);
     assert(b.best_bid() == 15000 && b.depth(Side::Buy, 15000) == 150 && b.leaves(K + 2) == 150);
     assert(b.best_ask() == 15010 && b.depth(Side::Sell, 15010) == 100 && b.leaves(K + 3) == 0);

@@ -74,6 +74,10 @@ public:
             if (names_[i] == stock) return SymbolId(i);
         return std::nullopt;
     }
+    // Venue symbol id for an ITCH stock locate, if it is one of ours.
+    std::optional<SymbolId> symbol_at(uint16_t locate) const {
+        return sym_of_[locate] == kNone ? std::nullopt : std::optional<SymbolId>(sym_of_[locate]);
+    }
     const std::string& name(SymbolId s) const { return names_[s]; }
 
     size_t applied() const { return applied_; }  // messages that changed a book
