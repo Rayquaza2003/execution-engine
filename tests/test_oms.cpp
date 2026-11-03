@@ -2,8 +2,10 @@
 #include <cassert>
 #include <cstdio>
 #include <optional>
+#include <variant>
 #include <vector>
 
+#include "core/event_loop.hpp"
 #include "oms/oms.hpp"
 
 using S = OrdState;
@@ -255,6 +257,69 @@ static void test_race_cancel_before_ack() {
     assert(r.v.book(r.s).order_count() == 0);
 }
 
+// End to end on the event loop: OMS and venue 50 us apart. The strategy
+// cancels at 100 us, but a seller hits the order at 120 us, before the cancel
+// lands at 150 us. Nobody scripts the race; latency creates it.
+struct ToVenue {
+    VenueRequest rq;
+};
+struct ToOms {
+    ExecReport rep;
+};
+struct CancelAt {
+    ClOrdId cl;
+};
+using Ev = std::variant<ToVenue, ToOms, CancelAt>;
+
+static std::vector<OmsFill> run_latency_race(size_t& invalid, OrdState& final_state) {
+    constexpr Nanos us = 1000, wire = 50 * us;
+    EventLoop<Ev> loop;
+    Venue venue;
+    SymbolId s = venue.add_symbol();
+    Oms oms(7, 1'000'000);
+    std::vector<VenueRequest> req;
+    VenueOut out;
+
+    auto ship = [&] {
+        for (const VenueRequest& r : req) loop.schedule_in(wire, ToVenue{r});
+        req.clear();
+    };
+    oms.submit({1, s, Side::Buy, OrdType::Limit, Tif::Day, 100, 10}, req);
+    ship();
+    loop.schedule_at(100 * us, CancelAt{1});
+    loop.schedule_at(120 * us, ToVenue{NewOrder{1, 0, s, Side::Sell, OrdType::Limit, Tif::Day, 100, 10}});
+
+    loop.run([&](Ev& e) {
+        if (auto* tv = std::get_if<ToVenue>(&e)) {
+            venue.set_time(loop.now());
+            venue.on_request(tv->rq, out);
+            for (const ExecReport& r : out.reports)
+                if (r.id >= 1'000'000) loop.schedule_in(wire, ToOms{r});  // only our reports travel back
+            out.clear();
+        } else if (auto* to = std::get_if<ToOms>(&e)) {
+            oms.set_time(loop.now());
+            oms.on_report(to->rep);
+        } else {
+            oms.cancel(std::get<CancelAt>(e).cl, req);
+            ship();
+        }
+    });
+    invalid = oms.invalid_transitions();
+    final_state = oms.find(1)->state;
+    return oms.fills();
+}
+
+static void test_latency_creates_the_race_deterministically() {
+    size_t invalid = 1;
+    OrdState st = S::PendingNew;
+    auto a = run_latency_race(invalid, st);
+    assert(st == S::Filled && invalid == 0);
+    assert(a.size() == 1 && a[0].qty == 10 && a[0].time == 170'000);  // fill at 120 us + 50 us wire
+
+    auto b = run_latency_race(invalid, st);  // same inputs, same result
+    assert(b.size() == a.size() && b[0].time == a[0].time && b[0].px == a[0].px);
+}
+
 static_assert(transition(OrdState::CancelPending, OrdEvent::Fill, true) == OrdState::Filled,
               "a fill in flight beats the cancel");
 
@@ -272,5 +337,6 @@ int main() {
     test_race_replace_loses_to_full_fill();
     test_race_replace_after_partial_fill();
     test_race_cancel_before_ack();
+    test_latency_creates_the_race_deterministically();
     std::puts("all tests passed");
 }
