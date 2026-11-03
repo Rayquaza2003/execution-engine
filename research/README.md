@@ -209,3 +209,91 @@ comparison is paired: each algo minus TWAP on the same parent.
   morning and testing on the same morning would overfit. That needs more
   days of data.
 - **Coverage:** one morning, five symbols, and 1-minute parents.
+
+## Smart order routing (S8)
+
+```
+./build/sor_compare 01302019.NASDAQ_ITCH50 research/fill_prob.csv sor.csv AAPL MSFT SPY QQQ TSLA
+python3 research/sor_compare.py sor.csv
+```
+
+### The venues
+
+Three venues are carved out of the one real NASDAQ book. Each real order
+goes to one venue, picked by a hash of its order reference. Its executions,
+cancels and replaces follow it there. So each venue holds a random slice of
+the market, and together they hold all of it. A test checks that the three
+books add up, level by level, to the single-venue replay.
+
+| venue | share of orders | take fee | make fee | latency (one way) |
+|---|---|---|---|---|
+| A | 10% | 0.10¢ | 0.05¢ rebate | 50 us |
+| B | 60% | 0.30¢ | 0.25¢ rebate | 100 us |
+| C | 30% | 0.10¢ rebate (inverted) | 0.15¢ | 1 ms |
+
+### The parent orders and modes
+
+For each symbol, a parent starts every 5 s from 09:30:30 to 09:37:00, and
+buys and sells alternate. Each is sized at 1% of the previous minute's volume
+(median 400 shares). That gives 395 parents. Each parent runs in four modes:
+
+- **Take:** route the whole order as IOCs, and route the remainder again once
+  every child is back.
+  - The smart router water-fills across venues by all-in cost per share:
+    price, plus taker fee, plus `sigma * sqrt(latency)`, plus a retry cost on
+    venues whose IOCs miss.
+  - The naive router sends everything to the venue showing the best price.
+- **Post:** rest the whole order at the best price on our side for 2 s,
+  then take the rest with the smart router.
+  - The smart router picks the venue with the best expected value: fill
+    probability (from the S6 table, corrected online per venue) times the
+    rebate and spread earned, against the cost of crossing later.
+  - The naive router always rests where the rebate is biggest (B).
+
+### Results
+
+Paired results, smart minus naive, all-in cost in bps of the arrival mid:
+
+| | cost | of which fees | other |
+|---|---|---|---|
+| taking | **-0.039 ± 0.004** | -0.042 ± 0.004 | done in 1.03 rounds instead of 2.35 |
+| resting | +0.116 ± 0.038 | +0.018 ± 0.003 | 3.0 points fewer passive fills |
+
+![sor](figures/sor.png)
+
+- **Smart taking wins, by fees alone.** The naive router ignores fees.
+  When several venues show the same price, it takes from B, which costs
+  0.30¢. The smart router takes C first, because C pays takers. It sends
+  38% of its shares to C, against 19% for naive. The prices paid are the
+  same, so the whole 0.04 bps gain is fees.
+- **Smart taking finishes in one round.** It splits across venues at once.
+  Naive takes one venue's touch per round, so it needs about 2.4 rounds.
+  This barely matters here, because the replayed quotes rarely vanish
+  within a round trip. Even on C, 99% of IOC shares filled.
+- **Smart resting loses to rebate chasing.** It is 0.12 bps worse, and the
+  difference is real. The S6 fill table was measured on one consolidated
+  book, where every aggressor reaches the front of the queue. In this
+  replay, a real aggressor only trades on the venue that held its order in
+  the feed. So a thin venue (A) gets few fills even when its queue is short.
+  The table, read as queue / flow share, is far too optimistic there.
+  Correcting the table online from our own fills halved the gap in passive
+  fills, but it did not close it.
+
+### What this shows
+
+- **The router can only be as good as its fill model.** A SOR's passive
+  routing depends on a fill model calibrated per venue.
+- **The simulator decides who wins.** In this simulator, the deepest venue
+  wins by construction. On real markets, other routers send aggressive flow
+  to whichever venue is alone at the best price. That model, where taking
+  flow is rerouted to the best price, is the next thing to add before
+  trusting any passive routing result.
+
+### Limits
+
+- **Fees:** they are typical US equity levels, not any one exchange's
+  schedule.
+- **Market data delay:** the router reads all three books instantly. Only
+  orders pay latency. Quote fading and latency arbitrage are not modeled.
+- **Coverage:** one morning and five symbols. There are 395 parents per
+  mode, each run as 1 replay per mode over 3 venues.

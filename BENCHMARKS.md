@@ -213,3 +213,10 @@ The plain replay in S5 took 0.61 s, so the algos and the OMS add little. TCA res
 `Venue::replay_execute` now fills our resting orders that rank ahead of a feed execution. The
 code walks from the best price down to the executed order, and executions almost always hit
 the front of the best level. The order book checksum is still `2a79b8de12e4cd7d`.
+
+## S8: smart order routing
+
+`sor_compare` builds three venues from one replay of the 751 MB file. Each feed message for
+our symbols goes to every venue, and only the venue that holds the order changes its book.
+It runs 395 parents in each of 4 modes. The whole run takes 1.97 s (3 runs, all 1.97 s),
+about 0.49 s per mode. Two runs give byte-identical CSVs. Results are in `research/README.md`.
