@@ -253,6 +253,17 @@ public:
         }
     }
 
+    // Kill switch: risk refuses every new order and replace from now on, and
+    // every working order gets a cancel. Returns the number of cancels sent.
+    // Without a Risk attached it only cancels.
+    // ponytail: walks every order ever sent; keep a live list if that gets long.
+    size_t kill(std::vector<VenueRequest>& out) {
+        if (risk_) risk_->kill();
+        size_t sent = 0;
+        for (const OmsOrder& o : orders_) sent += cancel(o.cl, out);
+        return sent;
+    }
+
     const OmsOrder* find(ClOrdId cl) const {
         uint32_t slot = by_cl_.find(cl);
         return slot == IdIndex::kMissing ? nullptr : &orders_[slot];

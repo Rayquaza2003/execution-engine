@@ -161,6 +161,23 @@ static void test_risk_tracks_fills_and_cancels() {
     assert(r.risk.open_qty(r.s, B) == 0 && r.risk.open_orders() == 0);
 }
 
+static void test_kill_switch_cancels_everything_working() {
+    Rig r;
+    r.oms.submit(r.lim(1, B, 99, 10), r.req);
+    r.oms.submit(r.lim(2, Sl, 101, 10), r.req);
+    r.send();
+    r.oms.replace(2, 102, 8, r.req);           // replace in flight
+    r.oms.submit(r.lim(3, B, 98, 5), r.req);    // new order in flight
+    assert(r.oms.kill(r.req) == 3 && r.req.size() == 5);
+    r.send();
+    for (ClOrdId cl : {1, 2, 3}) assert(r.o(cl).state == OrdState::Cancelled);
+    assert(r.risk.open_orders() == 0 && r.risk.open_qty(r.s, B) == 0 && r.risk.open_qty(r.s, Sl) == 0);
+    assert(r.v.book(r.s).order_count() == 0 && r.oms.invalid_transitions() == 0);
+
+    r.oms.submit(r.lim(4, B, 100, 1), r.req);
+    assert(r.req.empty() && r.o(4).last_reject == Reject::KillSwitch);
+}
+
 // Random flow: after every step, risk's running totals must equal what the
 // OMS order states say. Catches any open-qty or count update that goes missing.
 static void test_risk_totals_match_oms_under_random_flow() {
@@ -215,6 +232,7 @@ int main() {
     test_kill_switch_blocks_everything();
     test_risk_rejects_come_back_as_reports();
     test_risk_tracks_fills_and_cancels();
+    test_kill_switch_cancels_everything_working();
     test_risk_totals_match_oms_under_random_flow();
     std::puts("all tests passed");
 }
