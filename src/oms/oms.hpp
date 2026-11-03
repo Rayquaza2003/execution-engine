@@ -1,8 +1,12 @@
 #pragma once
 #include <cstdint>
+#include <deque>
 #include <optional>
+#include <vector>
 
+#include "core/id_index.hpp"
 #include "core/types.hpp"
+#include "exchange/venue.hpp"
 
 // Order lifecycle as seen by the trading firm.
 //
@@ -111,3 +115,180 @@ constexpr std::optional<OrdState> transition(OrdState s, OrdEvent e, bool filled
     }
     return std::nullopt;
 }
+
+using ClOrdId = uint64_t;  // the client's own key for an order, unique within one OMS
+
+struct ClientOrder {
+    ClOrdId cl;
+    SymbolId sym;
+    Side side;
+    OrdType type;
+    Tif tif;
+    Price px;
+    Qty qty;
+    Price stop_px = 0;
+};
+
+struct OmsOrder {
+    ClOrdId cl;
+    OrderId id;  // venue order id, assigned by the OMS from its own range
+    SymbolId sym;
+    Side side;
+    OrdType type;
+    Tif tif;
+    Price px;
+    Price stop_px;
+    Qty leaves;           // open quantity at the venue
+    Qty cum = 0;          // filled so far
+    double notional = 0;  // sum of fill price * qty, for the average price
+    OrdState state = OrdState::PendingNew;
+    Reject last_reject = Reject::None;
+    Price pending_px = 0;  // replace in flight
+    Qty pending_qty = 0;
+
+    double avg_px() const { return cum ? notional / double(cum) : 0.0; }
+};
+
+struct OmsFill {
+    Nanos time;
+    ClOrdId cl;
+    OrderId id;
+    SymbolId sym;
+    Side side;
+    Price px;
+    Qty qty;
+};
+
+// Order management for one trading account. Turns client intents into venue
+// requests and venue execution reports into order state, enforcing the state
+// machine above. Pure: requests go out through a vector, reports come in
+// through on_report, and the caller owns transport and timing.
+class Oms {
+public:
+    Oms(AccountId account, OrderId id_base, size_t expected = 1 << 16)
+        : account_(account), base_(id_base), by_cl_(expected) {}
+
+    void set_time(Nanos now) { now_ = now; }
+
+    struct Submitted {
+        const OmsOrder& order;
+        bool duplicate;  // ClOrdId seen before: nothing was sent
+    };
+
+    // Idempotent: resubmitting a ClOrdId (say, after a timeout) returns the
+    // existing order and sends nothing, so a retry can never double the position.
+    Submitted submit(const ClientOrder& c, std::vector<VenueRequest>& out) {
+        uint32_t slot = by_cl_.find(c.cl);
+        if (slot != IdIndex::kMissing) return {orders_[slot], true};
+        slot = uint32_t(orders_.size());
+        OrderId id = base_ + slot;
+        orders_.push_back({c.cl, id, c.sym, c.side, c.type, c.tif, c.px, c.stop_px, c.qty});
+        by_cl_.insert(c.cl, slot);
+        out.push_back(NewOrder{id, account_, c.sym, c.side, c.type, c.tif, c.px, c.qty, c.stop_px});
+        return {orders_.back(), false};
+    }
+
+    // False if the order is unknown or its state forbids it (terminal, or
+    // another cancel/replace is already in flight).
+    bool cancel(ClOrdId cl, std::vector<VenueRequest>& out) {
+        OmsOrder* o = find_mut(cl);
+        if (!o || !step(*o, OrdEvent::CancelReq)) return false;
+        out.push_back(CancelRequest{o->id, o->sym});
+        return true;
+    }
+
+    // qty is the new open quantity (the venue's replace semantics).
+    // ponytail: FIX replaces carry total OrderQty; convert at the gateway in S10.
+    bool replace(ClOrdId cl, Price px, Qty qty, std::vector<VenueRequest>& out) {
+        OmsOrder* o = find_mut(cl);
+        if (!o || !step(*o, OrdEvent::ReplaceReq)) return false;
+        o->pending_px = px;
+        o->pending_qty = qty;
+        out.push_back(ReplaceRequest{o->id, o->sym, px, qty});
+        return true;
+    }
+
+    void on_report(const ExecReport& r) {
+        if (r.id < base_ || r.id - base_ >= orders_.size()) {  // another client's order
+            ++foreign_;
+            return;
+        }
+        OmsOrder& o = orders_[r.id - base_];
+        if (!step(o, event_of(r))) {
+            ++invalid_;
+            return;
+        }
+        switch (r.type) {
+            case ExecType::Trade:
+                o.cum += r.last_qty;
+                o.leaves = r.leaves;
+                o.notional += double(r.last_px) * double(r.last_qty);
+                fills_.push_back({now_, o.cl, o.id, o.sym, o.side, r.last_px, r.last_qty});
+                break;
+            case ExecType::Replaced:
+                o.px = o.pending_px;
+                o.leaves = r.leaves;
+                break;
+            case ExecType::Cancelled:
+            case ExecType::Expired:
+            case ExecType::Rejected:
+                o.leaves = 0;
+                o.last_reject = r.reason;
+                break;
+            case ExecType::CancelRejected:
+            case ExecType::ReplaceRejected:
+                o.last_reject = r.reason;
+                break;
+            case ExecType::New:
+            case ExecType::Triggered:
+                break;
+        }
+    }
+
+    const OmsOrder* find(ClOrdId cl) const {
+        uint32_t slot = by_cl_.find(cl);
+        return slot == IdIndex::kMissing ? nullptr : &orders_[slot];
+    }
+
+    const std::vector<OmsFill>& fills() const { return fills_; }
+    size_t order_count() const { return orders_.size(); }
+    size_t invalid_transitions() const { return invalid_; }  // venue messages the state machine refused
+    size_t foreign_reports() const { return foreign_; }
+
+private:
+    static OrdEvent event_of(const ExecReport& r) {
+        switch (r.type) {
+            case ExecType::New: return OrdEvent::Ack;
+            case ExecType::Trade: return r.leaves ? OrdEvent::PartialFill : OrdEvent::Fill;
+            case ExecType::Cancelled: return OrdEvent::Cancelled;
+            case ExecType::Replaced: return OrdEvent::Replaced;
+            case ExecType::Rejected: return OrdEvent::Rejected;
+            case ExecType::Expired: return OrdEvent::Expired;
+            case ExecType::CancelRejected: return OrdEvent::CancelRejected;
+            case ExecType::ReplaceRejected: return OrdEvent::ReplaceRejected;
+            case ExecType::Triggered: return OrdEvent::Triggered;
+        }
+        return OrdEvent::Rejected;
+    }
+
+    bool step(OmsOrder& o, OrdEvent e) {
+        std::optional<OrdState> next = transition(o.state, e, o.cum > 0);
+        if (!next) return false;
+        o.state = *next;
+        return true;
+    }
+
+    OmsOrder* find_mut(ClOrdId cl) {
+        uint32_t slot = by_cl_.find(cl);
+        return slot == IdIndex::kMissing ? nullptr : &orders_[slot];
+    }
+
+    AccountId account_;
+    OrderId base_;
+    Nanos now_ = 0;
+    std::deque<OmsOrder> orders_;  // deque: references stay valid as orders are added
+    IdIndex by_cl_;                // ClOrdId -> slot in orders_
+    std::vector<OmsFill> fills_;
+    size_t invalid_ = 0;
+    size_t foreign_ = 0;
+};
