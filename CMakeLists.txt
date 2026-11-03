@@ -24,3 +24,4 @@ foreach(name orderbook id_index event_loop ring venue oms risk)
 endforeach()
 
 add_executable(bench_book bench/bench_book.cpp)
+add_executable(bench_risk bench/bench_risk.cpp)
