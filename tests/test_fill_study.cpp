@@ -33,6 +33,7 @@ FillConfig config(std::vector<Nanos> latencies) {
     c.every = 1'000'000;  // one decision in these tests
     c.horizon = 1000;
     c.markout = 100;
+    c.join_new_levels = false;
     return c;
 }
 
@@ -105,6 +106,31 @@ static void test_post_only_reject() {
     assert(r.rows[0].side == Side::Sell && r.rows[0].queue_ahead == 100);
 }
 
+// An order that opens a new best level triggers a join: the fast order is
+// second in the fresh queue, the slow one also queues behind a later add.
+static void test_join_new_level() {
+    itch::Writer w;
+    w.stock_directory(1, 0, "AAPL");
+    w.add(1, 10, 1, Side::Buy, 100, "AAPL", 10 * D);
+    w.add(1, 20, 2, Side::Sell, 100, "AAPL", 10 * D + 200);
+    w.add(1, 1010, 3, Side::Buy, 100, "AAPL", 10 * D + 100);  // new best bid 10.01
+    w.add(1, 1020, 4, Side::Buy, 300, "AAPL", 10 * D + 100);  // joins it
+    w.add(1, 1030, 5, Side::Buy, 100, "AAPL", 10 * D);        // not a new level
+    w.add(1, 3000, 6, Side::Buy, 100, "AAPL", 9 * D);         // a new level, but below the best
+    FillConfig c = config({0, 50});
+    c.join_new_levels = true;
+    Run r(std::move(c));
+    r.feed(w);
+    size_t joins = 0;
+    for (const FillRow& x : r.rows) {
+        if (!x.new_level) continue;
+        ++joins;
+        assert(x.side == Side::Buy && x.px == 1001 && x.decided == 1010);
+        assert(x.queue_ahead == (x.latency == 0 ? 100 : 400));
+    }
+    assert(joins == 2 && r.rows.size() == 6);  // plus the 4 timer orders at 1000
+}
+
 // A whole synthetic day: every decision ends as a row, a reject or still open,
 // and rows obey the horizon.
 static void test_synthetic_accounting() {
@@ -139,6 +165,7 @@ int main() {
     test_queue_drains_then_fills();
     test_trade_through_and_crossing_add();
     test_post_only_reject();
+    test_join_new_level();
     test_synthetic_accounting();
     std::puts("all tests passed");
 }

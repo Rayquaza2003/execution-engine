@@ -12,7 +12,9 @@
 // Queue-position / fill-probability study on top of an ITCH replay.
 //
 // Every `every` ns from `start`, for each symbol and side, we decide to join
-// the best price. For each latency in the sweep, a virtual order reaches the
+// the best price; optionally also whenever an order opens a new best price
+// level (the race to be first in a fresh queue, where latency matters most).
+// For each latency in the sweep, a virtual order reaches the
 // book `latency` later and goes to the back of the queue at that price. The
 // virtual orders never touch the book, so the replay stays exact; instead
 // each one remembers the ids of the real orders ahead of it:
@@ -36,12 +38,14 @@ struct FillConfig {
     Nanos every = 100'000'000;         // decision interval
     Nanos horizon = 10'000'000'000;    // an unfilled order is cancelled after this
     Nanos markout = 1'000'000'000;     // mid measured this long after the fill
+    bool join_new_levels = true;       // also decide when a new best level opens
 };
 
 struct FillRow {
     SymbolId sym;
     Side side;
     Nanos latency;
+    bool new_level;     // decided because a new best level opened (else the timer)
     Nanos decided;      // feed time of the decision
     Price px;           // book ticks
     Qty queue_ahead;    // shares ahead of us on arrival
@@ -143,19 +147,20 @@ private:
 
     void decide(SymbolId s) {
         const OrderBook& b = venue_.book(s);
-        for (Side side : {Side::Buy, Side::Sell}) {
-            std::optional<Price> best = side == Side::Buy ? b.best_bid() : b.best_ask();
-            if (!best) continue;
-            for (Nanos lat : cfg_.latencies) {
-                uint32_t i = alloc();
-                Virtual& v = orders_[i];
-                v.state = Virtual::Pending;
-                v.row = {s, side, lat, loop_.now(), *best, 0, false, 0, std::nan("")};
-                loop_.schedule_in(lat, {Ev::Arrive, i, v.gen});
-                ++decided_;
-            }
-        }
+        if (std::optional<Price> bid = b.best_bid()) join(s, Side::Buy, *bid, false);
+        if (std::optional<Price> ask = b.best_ask()) join(s, Side::Sell, *ask, false);
         loop_.schedule_in(cfg_.every, {Ev::Decide, s, 0});
+    }
+
+    void join(SymbolId s, Side side, Price px, bool new_level) {
+        for (Nanos lat : cfg_.latencies) {
+            uint32_t i = alloc();
+            Virtual& v = orders_[i];
+            v.state = Virtual::Pending;
+            v.row = {s, side, lat, new_level, loop_.now(), px, 0, false, 0, std::nan("")};
+            loop_.schedule_in(lat, {Ev::Arrive, i, v.gen});
+            ++decided_;
+        }
     }
 
     // A message is about to take qty off a resting order.
@@ -186,11 +191,16 @@ private:
         if (exec) through(s, r.side, r.price, false);
     }
 
-    // A real order just rested; if it reaches our price on the other side, it
-    // would have traded with us.
+    // A real order just rested. If it reaches our price on the other side, it
+    // would have traded with us. If it opened a new best level, join behind it.
     void added(SymbolId s, OrderId id) {
-        OrderBook::Reduced r = venue_.book(s).peek(id);
-        if (r.qty) through(s, r.side == Side::Buy ? Side::Sell : Side::Buy, r.price, true);
+        const OrderBook& b = venue_.book(s);
+        OrderBook::Reduced r = b.peek(id);
+        if (!r.qty) return;
+        through(s, r.side == Side::Buy ? Side::Sell : Side::Buy, r.price, true);
+        std::optional<Price> best = r.side == Side::Buy ? b.best_bid() : b.best_ask();
+        if (cfg_.join_new_levels && loop_.now() >= cfg_.start && best == r.price && b.depth(r.side, r.price) == r.qty)
+            join(s, r.side, r.price, true);
     }
 
     // Fills every live order on `side` priced better than px (or equal, if inclusive).
