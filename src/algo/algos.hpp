@@ -81,6 +81,7 @@ public:
     bool owns(ClOrdId cl) const { return cl > base_ && cl <= base_ + sent_; }
     bool done() const { return done_; }
     Qty filled() const { return filled_; }
+    size_t children() const { return sent_; }
 
     // Shares that should be done by `now`, given market volume since start.
     Qty target(Nanos now, Qty volume) const {

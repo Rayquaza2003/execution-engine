@@ -23,7 +23,8 @@ public:
         Nanos time;  // at the venue
         Price px;
         Qty qty;
-        double mid;  // just before the fill
+        double mid;    // just before the fill
+        bool passive;  // a resting child, not an IOC
     };
 
     // What TCA needs besides the fills, captured on the feed clock.
@@ -177,7 +178,7 @@ private:
             uint32_t i = uint32_t((o->cl >> 32) - 1);
             if (r.type == ExecType::Trade) {
                 ours_[r.sym] += r.last_qty;
-                fills_.push_back({i, loop_.now(), r.last_px, r.last_qty, mid_before});
+                fills_.push_back({i, loop_.now(), r.last_px, r.last_qty, mid_before, o->tif != Tif::Ioc});
             }
             Ev e{Ev::ToClient, i};
             e.rep = r;

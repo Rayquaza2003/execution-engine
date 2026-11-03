@@ -74,7 +74,8 @@ static void test_twap_rests_then_crosses() {
     r.feed(w);
     const auto& f = r.sim.fills();
     assert(a.done() && a.filled() == 200 && f.size() == 3);
-    assert(f[0].time == 2200 && f[0].px == 1000 && f[0].qty == 50 && f[0].mid == 1000.5);
+    assert(f[0].time == 2200 && f[0].px == 1000 && f[0].qty == 50 && f[0].mid == 1000.5 && f[0].passive);
+    assert(!f[1].passive && a.children() == 3);
     // the new 100 crosses at once; the 50 left resting crosses when its cancel lands
     assert(f[1].px == 1001 && f[1].qty == 100 && f[2].px == 1001 && f[2].qty == 50 && f[2].time > f[1].time);
     assert(r.risk.position(0) == 200 && r.oms.invalid_transitions() == 0);
