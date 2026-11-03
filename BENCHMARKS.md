@@ -110,3 +110,35 @@ The S1 and S2 builds ran alternately, 7 runs each, on the same machine and workl
 
 The cost is not measurable; the difference is within run-to-run noise. The trade checksum is
 still `2a79b8de12e4cd7d`, and the timed pass still makes zero heap allocations.
+
+## S4: pre-trade risk check
+
+`bench_risk` times `Risk::check()` alone. The setup is 64 symbols, each with open
+exposure and a position, and every limit is enabled. One check takes far less than the
+41.67 ns clock tick, so the bench times 10M checks per pass and divides. It runs 7 passes
+and takes the median. The table shows the median of 5 such runs:
+
+| workload                                                  | ns/check |
+|-----------------------------------------------------------|---------:|
+| random mix: 24% rejected, across every reason, 5% market orders | 11.16    |
+| all pass: same code, predictable branches                 | 8.49     |
+
+The two rows differ by about 2.7 ns. That gap is branch misprediction: in the random mix,
+which check rejects is unpredictable.
+
+Every check is constant-time arithmetic on running totals:
+
+- kill flag
+- quantity
+- reference price
+- collar
+- notional
+- worst-case position
+- open orders
+- loss
+
+There are no locks, allocations, or scans over orders. The kill flag is a relaxed
+`std::atomic<bool>`. Replacing it with a plain `false` made no measurable difference
+(8.43 vs 8.49 ns).
+
+The order book bench is unchanged: checksum `2a79b8de12e4cd7d`, 0 hot-path allocations.
