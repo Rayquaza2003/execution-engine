@@ -26,7 +26,7 @@ int main(int argc, char** argv) {
 
     constexpr Nanos kBar = 1'000'000'000;  // ponytail: fixed 1 s bars; add a flag when a study needs another
     Venue venue;
-    ItchReplay replay(venue, want, 100, 1 << 20);
+    ItchReplay replay(venue, want);
     MarketData md(1, want.size());
     Microstructure ms(md, want.size(), kBar);
     VenueOut out;
