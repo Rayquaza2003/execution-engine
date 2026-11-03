@@ -356,7 +356,26 @@ static void test_leaves() {
     assert(b.leaves(1) == 0 && b.leaves(42) == 0);
 }
 
+static void test_reduce_keeps_priority() {
+    OrderBook b;
+    std::vector<Trade> t;
+    std::vector<LevelChange> lv;
+    b.limit(1, Side::Sell, 100, 10, t);
+    b.limit(2, Side::Sell, 100, 5, t);
+    b.publish_levels_to(&lv);
+    OrderBook::Reduced r = b.reduce(1, 7);
+    assert(r.side == Side::Sell && r.price == 100 && r.qty == 7);
+    assert(b.leaves(1) == 3 && b.depth(Side::Sell, 100) == 8);
+    assert(lv.size() == 1 && lv[0].qty == 8);
+    b.market(3, Side::Buy, 3, t);  // order 1 is still first in the queue
+    assert(t.size() == 1 && t[0].sell_id == 1 && b.leaves(1) == 0 && b.leaves(2) == 5);
+
+    assert(b.reduce(2, 99).qty == 5 && b.order_count() == 0 && !b.best_ask());  // capped, removed
+    assert(b.reduce(42, 1).qty == 0);
+}
+
 int main() {
+    test_reduce_keeps_priority();
     test_leaves();
     test_self_trade_prevention();
     test_ioc();

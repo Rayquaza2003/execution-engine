@@ -111,6 +111,32 @@ public:
         return limit(id, side, px, qty, out, tif, account);
     }
 
+    struct Reduced {
+        Side side;
+        Price price;
+        Qty qty;  // taken off the book; 0 = id not on the book
+    };
+
+    // Takes up to qty off a resting order without touching its time priority
+    // (a partial cancel, or an execution reported by an outside feed). The
+    // order is removed when it reaches zero.
+    Reduced reduce(OrderId id, Qty qty) {
+        uint32_t o = index_.find(id);
+        if (o == IdIndex::kMissing) return {Side::Buy, 0, 0};
+        Order& x = pool_[o];
+        Reduced r{x.side, x.price, std::min(qty, x.qty)};
+        if (r.qty == x.qty) {
+            cancel(id);
+            return r;
+        }
+        Ladder& L = x.side == Side::Buy ? bids_ : asks_;
+        Level& q = L.levels[x.price - L.base];
+        x.qty -= r.qty;
+        q.qty -= r.qty;
+        changed(x.side, x.price, q.qty);
+        return r;
+    }
+
     // Session close: removes every resting Day order (Gtc survives) and appends
     // its id to `expired`.
     void end_of_day(std::vector<OrderId>& expired) {
