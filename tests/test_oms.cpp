@@ -50,6 +50,8 @@ static const std::vector<Rule> kSpec = {
     {S::CancelPending, E::Expired, S::Expired, S::Expired},
     {S::CancelPending, E::Rejected, S::Rejected, S::Rejected},
     {S::CancelPending, E::CancelRejected, S::Acknowledged, S::PartiallyFilled},
+    {S::CancelPending, E::Replaced, S::CancelPending, S::CancelPending},
+    {S::CancelPending, E::ReplaceRejected, S::CancelPending, S::CancelPending},
 
     {S::ReplacePending, E::Replaced, S::Acknowledged, S::PartiallyFilled},
     {S::ReplacePending, E::ReplaceRejected, S::Acknowledged, S::PartiallyFilled},
@@ -58,6 +60,7 @@ static const std::vector<Rule> kSpec = {
     {S::ReplacePending, E::Fill, S::Filled, S::Filled},
     {S::ReplacePending, E::Cancelled, S::Cancelled, S::Cancelled},
     {S::ReplacePending, E::Expired, S::Expired, S::Expired},
+    {S::ReplacePending, E::CancelReq, S::CancelPending, S::CancelPending},
 };
 
 static void test_every_state_event_pair_matches_spec() {
@@ -248,6 +251,17 @@ static void test_race_replace_after_partial_fill() {
     assert(r.o(1).state == S::PartiallyFilled && r.o(1).leaves == 8 && r.o(1).cum == 4);
 }
 
+static void test_cancel_chases_pending_replace() {
+    Rig r;
+    r.oms.submit(r.lim(1, Side::Buy, 100, 10), r.req);
+    r.send();
+    r.oms.replace(1, 101, 6, r.req);
+    assert(r.oms.cancel(1, r.req) && r.o(1).state == S::CancelPending && r.req.size() == 2);
+    r.send();  // Replaced, then Cancelled
+    assert(r.o(1).state == S::Cancelled && r.o(1).px == 101 && r.o(1).leaves == 0);
+    assert(r.oms.invalid_transitions() == 0 && r.v.book(r.s).order_count() == 0);
+}
+
 static void test_race_cancel_before_ack() {
     Rig r;
     r.oms.submit(r.lim(1, Side::Buy, 100, 10), r.req);
@@ -336,6 +350,7 @@ int main() {
     test_race_partial_fill_then_cancel();
     test_race_replace_loses_to_full_fill();
     test_race_replace_after_partial_fill();
+    test_cancel_chases_pending_replace();
     test_race_cancel_before_ack();
     test_latency_creates_the_race_deterministically();
     std::puts("all tests passed");

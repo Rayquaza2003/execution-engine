@@ -89,6 +89,8 @@ constexpr std::optional<OrdState> transition(OrdState s, OrdEvent e, bool filled
                 case E::Cancelled: return S::Cancelled;
                 case E::Expired: return S::Expired;
                 case E::Rejected: return S::Rejected;  // the new order itself was refused
+                case E::Replaced:        // a replace was in flight when the cancel went out
+                case E::ReplaceRejected: return S::CancelPending;
                 case E::CancelRejected: return live;
                 default: return std::nullopt;
             }
@@ -101,6 +103,7 @@ constexpr std::optional<OrdState> transition(OrdState s, OrdEvent e, bool filled
                 case E::Fill: return S::Filled;
                 case E::Cancelled: return S::Cancelled;
                 case E::Expired: return S::Expired;
+                case E::CancelReq: return S::CancelPending;  // the venue answers the replace first
                 default: return std::nullopt;
             }
         case S::Filled:
