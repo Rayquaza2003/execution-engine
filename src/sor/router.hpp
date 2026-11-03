@@ -23,8 +23,12 @@
 //
 //   p_fill * (half_spread - make_fee) - (1 - p_fill) * (half_spread + cheapest take_fee)
 //
-// p_fill comes from the S6 table, reading the venue's queue as the queue that
-// would face the same flow in the whole market (queue / flow share).
+// p_fill starts from the S6 table, reading the venue's queue as the queue
+// that would face the same flow in the whole market (queue / flow share).
+// That table was measured on one consolidated book, so it is corrected per
+// venue by how far its predictions have missed on our own resting orders
+// (learn_post). On a thin venue few aggressors arrive at all, so the raw
+// table is too optimistic there.
 //
 // The naive router sends everything to whichever venue shows the best price,
 // and rests wherever the maker rebate is largest.
@@ -55,10 +59,12 @@ public:
     double w_latency = 1;
     double retry = 1;  // ticks lost when an IOC comes back unfilled
 
-    explicit Router(std::vector<VenueConfig> venues) : v_(std::move(venues)), ratio_(v_.size(), 1.0) {}
+    explicit Router(std::vector<VenueConfig> venues)
+        : v_(std::move(venues)), ratio_(v_.size(), 1.0), bias_(v_.size(), 0.0) {}
 
     const std::vector<VenueConfig>& venues() const { return v_; }
     double ratio(uint32_t v) const { return ratio_[v]; }
+    double bias(uint32_t v) const { return bias_[v]; }
 
     // sigma: typical mid move in ticks over 1 ns, scaled by sqrt(ns).
     std::vector<Slice> take(Side side, Qty qty, const std::vector<VenueBook>& books, double sigma) const {
@@ -102,19 +108,25 @@ public:
         return {{uint32_t(best), top.price, std::min(qty, top.qty)}};
     }
 
+    struct Post {
+        uint32_t venue;
+        double p_fill;  // predicted, for learn_post
+    };
+
     // Venue to rest at price px (the best price on our side across venues).
-    uint32_t post(Price px, const std::vector<VenueBook>& books, const FillTable& table, Nanos horizon,
-                  double half_spread) const {
+    Post post(Price px, const std::vector<VenueBook>& books, const FillTable& table, Nanos horizon,
+              double half_spread) const {
         double cheapest_take = v_[0].take_fee;
         for (const VenueConfig& c : v_) cheapest_take = std::min(cheapest_take, c.take_fee);
-        uint32_t best = 0;
+        Post best{0, 0};
         double best_ev = -INFINITY;
         for (uint32_t v = 0; v < books.size(); ++v) {
             const LevelChange& n = books[v].near;
             Qty queue = n.qty && n.price == px ? n.qty : 0;  // joining a new level: nobody ahead
             double p = table.p_fill(Qty(double(queue) / v_[v].flow), v_[v].latency, horizon);
+            p = std::clamp(p + bias_[v], 0.0, 1.0);
             double ev = p * (half_spread - v_[v].make_fee) - (1 - p) * (half_spread + cheapest_take);
-            if (ev > best_ev) best = v, best_ev = ev;
+            if (ev > best_ev) best = {v, p}, best_ev = ev;
         }
         return best;
     }
@@ -127,6 +139,12 @@ public:
         return best;
     }
 
+    // A resting order on venue v ended its rest having filled `filled` (0..1)
+    // where post() predicted `predicted`.
+    void learn_post(uint32_t v, double predicted, double filled) {
+        bias_[v] = 0.9 * bias_[v] + 0.1 * (filled - (predicted - bias_[v]));
+    }
+
     // An IOC to venue v came back: `filled` of `sent`.
     void learn(uint32_t v, Qty sent, Qty filled) {
         if (sent) ratio_[v] = 0.9 * ratio_[v] + 0.1 * double(filled) / double(sent);
@@ -135,4 +153,5 @@ public:
 private:
     std::vector<VenueConfig> v_;
     std::vector<double> ratio_;  // EWMA of filled / sent per venue, for IOCs
+    std::vector<double> bias_;   // EWMA of realized - table fill probability per venue, resting
 };

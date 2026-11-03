@@ -79,9 +79,9 @@ static void test_smart_and_naive_take() {
         const SorSim::Result& res = r.sim.result(0);
         assert(res.filled == 150 && res.done_at > 0 && res.arrival_mid == 999.0 && res.passive == 0);
         if (mode == SorSim::Mode::SmartTake) {
-            assert(res.rounds == 1 && std::fabs(res.cost - (100 * 999.9 + 50 * 1000.1)) < 1e-6);
+            assert(res.rounds == 1 && res.notional == 150 * 1000.0 && std::fabs(res.fees - (100 * -0.1 + 50 * 0.1)) < 1e-9);
         } else {
-            assert(res.rounds == 2 && std::fabs(res.cost - (100 * 1000.1 + 50 * 999.9)) < 1e-6);
+            assert(res.rounds == 2 && res.notional == 150 * 1000.0 && std::fabs(res.fees - (100 * 0.1 + 50 * -0.1)) < 1e-9);
         }
         assert(r.oms.invalid_transitions() == 0 && r.risk.position(0) == 150);
     }
@@ -103,7 +103,7 @@ static void test_post_then_take_the_rest() {
     r.feed(w);
     const SorSim::Result& res = r.sim.result(0);
     assert(res.venue_post == 1 && res.filled == 200 && res.passive == 60 && res.rounds == 1);
-    assert(std::fabs(res.cost - (60 * (1000 - 0.25) + 140 * (1001 + 0.1))) < 1e-6);
+    assert(res.notional == 60 * 1000.0 + 140 * 1001.0 && std::fabs(res.fees - (60 * -0.25 + 140 * 0.1)) < 1e-9);
 }
 
 // All four modes on a synthetic feed: every parent ends, nothing overfills,
@@ -129,7 +129,7 @@ static void test_modes_on_synthetic_feed() {
             for (const SorSim::Fill& f : sim.fills())
                 if (f.parent == i) sum += f.qty;
             assert(res.done_at && res.filled <= 800 && sum == res.filled && res.filled > 0);
-            total += res.cost;
+            total += res.notional + res.fees;
         }
         assert(oms.invalid_transitions() == 0);
         if (pass == 0) first = total;

@@ -63,10 +63,16 @@ static void test_post_weighs_rebate_against_fill_chance() {
     b.near = {Side::Buy, 100, 1200};  // 1200 / 0.6 = 2000: p 0.2
     c.near = {Side::Buy, 100, 600};   // 2000: p 0.2
     // half spread 0.5, cheapest take -0.1: A 0.8*0.55 - 0.2*0.4 = 0.36; B 0.2*0.75 - 0.8*0.4 = -0.17
-    assert(r.post(100, {a, b, c}, t, 1'000'000'000, 0.5) == 0);
+    Router::Post p = r.post(100, {a, b, c}, t, 1'000'000'000, 0.5);
+    assert(p.venue == 0 && p.p_fill == 0.8);
     b.near.qty = 60;  // B's queue is now short too: its bigger rebate wins
-    assert(r.post(100, {a, b, c}, t, 1'000'000'000, 0.5) == 1);
+    assert(r.post(100, {a, b, c}, t, 1'000'000'000, 0.5).venue == 1);
     assert(r.post_naive() == 1);
+
+    // B keeps filling far less often than the table says: it learns, and A wins again.
+    for (int i = 0; i < 30; ++i) r.learn_post(1, 0.8 + r.bias(1), 0.1);  // table says 0.8 for B now
+    assert(r.bias(1) < -0.6 && r.bias(1) > -0.71);  // converging to 0.1 - 0.8
+    assert(r.post(100, {a, b, c}, t, 1'000'000'000, 0.5).venue == 0);
 }
 
 int main() {

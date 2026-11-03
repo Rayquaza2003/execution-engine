@@ -49,7 +49,8 @@ public:
         double arrival_mid = NAN;
         Nanos done_at = 0;
         Qty filled = 0;
-        double cost = 0;  // sum of qty * (price + fee), ticks
+        double notional = 0;  // sum of qty * price, ticks
+        double fees = 0;      // sum of qty * fee, ticks: a cost on buys and sells alike
         uint32_t rounds = 0;
         Qty passive = 0;
         uint32_t venue_post = 0;  // post modes: where it rested
@@ -117,6 +118,7 @@ private:
         Result r;
         uint32_t live;  // children not yet terminal
         bool done;
+        double predicted = NAN;  // smart post: fill probability the router expected
     };
     struct Child {
         uint32_t parent, venue;
@@ -197,11 +199,12 @@ private:
         bool post = p.p.mode == Mode::SmartPost || p.p.mode == Mode::NaivePost;
         Price px = p.p.side == Side::Buy ? q.bid : q.ask;
         if (!post || !(p.p.side == Side::Buy ? q.bid_sz : q.ask_sz) || !q.two_sided()) return take(i);
-        uint32_t v = p.p.mode == Mode::NaivePost
-                         ? router_.post_naive()
-                         : router_.post(px, books(p.p.sym, p.p.side), *tables_[p.p.sym], rest_for_,
-                                        double(q.ask - q.bid) / 2);
+        Router::Post where{router_.post_naive(), NAN};
+        if (p.p.mode == Mode::SmartPost)
+            where = router_.post(px, books(p.p.sym, p.p.side), *tables_[p.p.sym], rest_for_, double(q.ask - q.bid) / 2);
+        uint32_t v = where.venue;
         p.r.venue_post = v;
+        p.predicted = where.p_fill;
         submit(i, v, Tif::Day, px, p.p.qty);
         loop_.schedule_in(rest_for_, {Ev::RestOver, i});
     }
@@ -255,7 +258,8 @@ private:
                 fills_.push_back({c.parent, v, loop_.now(), r.last_px, r.last_qty, !c.ioc, fee});
                 Result& res = parents_[c.parent].r;
                 res.filled += r.last_qty;
-                res.cost += double(r.last_qty) * (double(r.last_px) + fee);
+                res.notional += double(r.last_qty) * double(r.last_px);
+                res.fees += double(r.last_qty) * fee;
                 if (!c.ioc) res.passive += r.last_qty;
             }
             Ev e{Ev::ToClient, v};
@@ -275,6 +279,8 @@ private:
         if (c.ioc) router_.learn(c.venue, c.sent, o.cum);
         P& p = parents_[c.parent];
         if (--p.live || p.done) return;
+        if (!c.ioc && !std::isnan(p.predicted))  // the rest is over: how did the prediction do?
+            router_.learn_post(c.venue, p.predicted, double(p.r.passive) / double(p.p.qty));
         take(c.parent);  // everything is back: route what is left (also ends a post)
     }
 
