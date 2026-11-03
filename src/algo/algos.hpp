@@ -148,7 +148,7 @@ private:
     // filled_ and the open quantity of live children; drops finished children.
     void tally(const Oms& oms) {
         Qty live_filled = 0;
-        crossing_ = resting_ = 0;
+        crossing_ = resting_ = cancelling_ = 0;
         size_t keep = 0;
         for (ClOrdId cl : live_) {
             const OmsOrder& o = *oms.find(cl);
@@ -158,6 +158,7 @@ private:
             }
             live_filled += o.cum;
             (o.tif == Tif::Ioc ? crossing_ : resting_) += o.leaves;
+            cancelling_ += o.state == OrdState::CancelPending;
             live_[keep++] = cl;
         }
         live_.resize(keep);
@@ -165,10 +166,12 @@ private:
     }
 
     // Crosses what is due (or everything, in cross-all mode) and rests the rest.
-    // Counting every open child in `open` means nothing is ever sent twice:
-    // shares behind a pending cancel are placed again only once it lands.
+    // Counting every open child in `open` means nothing is ever sent twice.
+    // While a cancel is in flight it waits: the freed shares must be split
+    // between crossing and resting once all of them are back.
     void place(const AlgoView& v, Oms& oms, std::vector<VenueRequest>& out) {
         if (filled_ >= p_.qty) return finish(oms, out);
+        if (cancelling_) return;
         Qty open = filled_ + crossing_ + resting_;
         Qty need = sat(want_, open);  // the schedule moves on timer steps only
         Qty lag = 0;
@@ -213,6 +216,7 @@ private:
     uint64_t sent_ = 0;
     std::vector<ClOrdId> live_;  // children not yet terminal
     Qty filled_ = 0, filled_done_ = 0, crossing_ = 0, resting_ = 0;
+    size_t cancelling_ = 0;  // live children with a cancel in flight
     Qty want_ = 0;  // schedule target at the last step
     Qty due_ = 0;   // target at the step before: should be done by now
     bool cross_all_ = false;  // until the next step: cross everything needed
