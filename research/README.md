@@ -261,9 +261,10 @@ Paired results, smart minus naive, all-in cost in bps of the arrival mid:
 
 ![sor](figures/sor.png)
 
-- **Smart taking wins, by fees alone.** The naive router ignores fees.
-  When several venues show the same price, it takes from B, which costs
-  0.30¢. The smart router takes C first, because C pays takers. It sends
+- **Smart taking wins, by fees alone.** The naive router looks only at
+  price. B is the deepest venue, so it most often shows the best price, and
+  B costs 0.30¢ to take from. The smart router takes C first at the same
+  price, because C pays takers. It sends
   38% of its shares to C, against 19% for naive. The prices paid are the
   same, so the whole 0.04 bps gain is fees.
 - **Smart taking finishes in one round.** It splits across venues at once.
