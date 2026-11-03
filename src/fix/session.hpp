@@ -35,7 +35,7 @@ public:
     enum class State { AwaitingLogon, Active, LoggedOut };
 
     struct Config {
-        std::string sender, target;
+        std::string sender, target;  // acceptor: an empty target takes the peer's Logon SenderCompID
         Nanos heartbeat = 30'000'000'000;
         bool initiator = false;
     };
@@ -95,6 +95,7 @@ public:
     }
 
     std::string& output() { return out_; }
+    const std::string& peer() const { return cfg_.target; }
     State state() const { return state_; }
     uint64_t next_out() const { return next_out_; }
     uint64_t next_in() const { return next_in_; }
@@ -144,6 +145,8 @@ private:
     void handle(const fix::Message& m, Nanos now, F& app) {
         std::string_view type = m.type();
         std::optional<int64_t> seq = m.get_int(fix::MsgSeqNum);
+        if (cfg_.target.empty() && state_ == State::AwaitingLogon && type == "A")  // acceptor: learn who called
+            cfg_.target = std::string(m.get(fix::SenderCompID).value_or(""));
         if (!seq || m.get(fix::SenderCompID) != cfg_.target || m.get(fix::TargetCompID) != cfg_.sender) {
             ++garbled_;  // ponytail: should be a session-level Reject (3); dropped instead
             return;

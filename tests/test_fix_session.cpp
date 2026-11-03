@@ -136,6 +136,16 @@ static void test_seq_too_low_logs_out() {
     assert(out.find("35=5\x01") != std::string::npos && out.find("58=MsgSeqNum too low") != std::string::npos);
 }
 
+static void test_acceptor_learns_peer_from_logon() {
+    Session client({"ANYONE", "EXCH", 30 * kSec, true});
+    Session server({"EXCH", "", 30 * kSec, false});
+    client.logon(T0);
+    server.on_bytes(client.output().data(), client.output().size(), T0, [](const fix::Message&) {});
+    assert(server.state() == Session::State::Active && server.peer() == "ANYONE");
+    client.on_bytes(server.output().data(), server.output().size(), T0, [](const fix::Message&) {});
+    assert(client.state() == Session::State::Active);
+}
+
 static void test_logout_handshake_and_utc() {
     Pair p;
     p.up();
@@ -153,5 +163,6 @@ int main() {
     test_heartbeat_test_request_and_dead_peer();
     test_seq_too_low_logs_out();
     test_logout_handshake_and_utc();
+    test_acceptor_learns_peer_from_logon();
     std::puts("all tests passed");
 }
