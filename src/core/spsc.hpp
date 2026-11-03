@@ -13,6 +13,16 @@
 // when the cache says full (producer) or empty (consumer), so in steady state
 // the two cores rarely touch each other's cache line. The indices sit on
 // separate cache lines so they never false-share.
+// Spin-wait hint: tells the core this is a busy-wait loop, so it backs off
+// the shared cache line (and, on x86, stops speculating) between polls.
+inline void cpu_relax() {
+#if defined(__aarch64__)
+    asm volatile("yield");
+#elif defined(__x86_64__)
+    __builtin_ia32_pause();
+#endif
+}
+
 template <class T, size_t N>
 class Spsc {
     static_assert(N > 0 && (N & (N - 1)) == 0, "N must be a power of two");
