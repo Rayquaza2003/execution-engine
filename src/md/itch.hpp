@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <cstring>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -178,5 +179,60 @@ private:
         return m;
     }
 };
+
+// Synthetic feed for tests and benches: `symbols` stocks named SYM0, SYM1...
+// (locates 1..symbols) and n book messages. Buys rest below a fixed $100 mid
+// and sells above it, so the book never crosses. Mix: 45% add, 25% delete,
+// 10% partial cancel, 10% execute, 10% replace.
+inline void synthetic(Writer& w, size_t n, size_t symbols, uint64_t seed) {
+    std::mt19937_64 rng(seed);
+    struct Live {
+        uint64_t ref;
+        uint16_t locate;
+        Side side;
+        uint32_t shares;
+    };
+    std::vector<Live> live;
+    for (size_t s = 0; s < symbols; ++s) w.stock_directory(uint16_t(s + 1), 0, "SYM" + std::to_string(s));
+    auto price = [&](Side side) {
+        uint32_t off = 100 * uint32_t(1 + rng() % 50);  // 1-50 cents from the mid
+        return side == Side::Buy ? 1'000'000 - off : 1'000'000 + off;
+    };
+    uint64_t next_ref = 1;
+    Nanos ts = 34'200'000'000'000;  // 09:30
+    for (size_t i = 0; i < n; ++i) {
+        ts += rng() % 2000;
+        int k = int(rng() % 100);
+        if (live.empty() || k < 45) {
+            Live o{next_ref++, uint16_t(1 + rng() % symbols), rng() % 2 ? Side::Buy : Side::Sell,
+                   uint32_t(100 * (1 + rng() % 5))};
+            w.add(o.locate, ts, o.ref, o.side, o.shares, "SYM", price(o.side));
+            live.push_back(o);
+            continue;
+        }
+        size_t j = rng() % live.size();
+        Live& o = live[j];
+        uint32_t part = uint32_t(1 + rng() % o.shares);
+        if (k < 70) {
+            w.del(o.locate, ts, o.ref);
+            part = o.shares;
+        } else if (k < 80) {
+            w.cancel(o.locate, ts, o.ref, part);
+        } else if (k < 90) {
+            w.execute(o.locate, ts, o.ref, part, i);
+        } else {
+            uint64_t ref = next_ref++;
+            uint32_t shares = uint32_t(100 * (1 + rng() % 5));
+            w.replace(o.locate, ts, o.ref, ref, shares, price(o.side));
+            o.ref = ref;
+            o.shares = shares;
+            continue;
+        }
+        if (!(o.shares -= part)) {
+            o = live.back();
+            live.pop_back();
+        }
+    }
+}
 
 }  // namespace itch
