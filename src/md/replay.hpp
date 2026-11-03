@@ -22,26 +22,12 @@ public:
 
     // Applies every complete message in [p, p + n); returns bytes consumed.
     size_t feed(const uint8_t* p, size_t n, VenueOut& out) {
-        return itch::parse(p, n, [&](const auto& m) { on(m, out); });
+        return itch::parse(p, n, [&](const auto& m) { apply(m, out); });
     }
 
-    // Venue symbol id for a stock, once its directory message has arrived.
-    std::optional<SymbolId> symbol(const std::string& stock) const {
-        for (size_t i = 0; i < names_.size(); ++i)
-            if (names_[i] == stock) return SymbolId(i);
-        return std::nullopt;
-    }
-    const std::string& name(SymbolId s) const { return names_[s]; }
-
-    size_t applied() const { return applied_; }  // messages that changed a book
-    size_t dropped() const { return dropped_; }   // for our symbols but not applied (see on())
-    Nanos time() const { return now_; }
-
-private:
-    static constexpr uint32_t kNone = UINT32_MAX;
-
+    // One parsed message, for callers that act between messages.
     template <class M>
-    void on(const M& m, VenueOut& out) {
+    void apply(const M& m, VenueOut& out) {
         if constexpr (std::is_same_v<M, itch::StockDirectory>) {
             std::string stock(m.stock, 8);
             stock.erase(stock.find_last_not_of(' ') + 1);
@@ -81,6 +67,21 @@ private:
             (ok ? applied_ : dropped_)++;
         }
     }
+
+    // Venue symbol id for a stock, once its directory message has arrived.
+    std::optional<SymbolId> symbol(const std::string& stock) const {
+        for (size_t i = 0; i < names_.size(); ++i)
+            if (names_[i] == stock) return SymbolId(i);
+        return std::nullopt;
+    }
+    const std::string& name(SymbolId s) const { return names_[s]; }
+
+    size_t applied() const { return applied_; }  // messages that changed a book
+    size_t dropped() const { return dropped_; }   // for our symbols but not applied (see on())
+    Nanos time() const { return now_; }
+
+private:
+    static constexpr uint32_t kNone = UINT32_MAX;
 
     Venue& v_;
     std::vector<std::string> want_;

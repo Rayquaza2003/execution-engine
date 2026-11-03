@@ -25,3 +25,4 @@ endforeach()
 
 add_executable(bench_book bench/bench_book.cpp)
 add_executable(bench_risk bench/bench_risk.cpp)
+add_executable(itch_replay tools/itch_replay.cpp)
