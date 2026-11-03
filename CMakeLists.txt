@@ -18,7 +18,7 @@ include_directories(src)
 
 enable_testing()
 # One assert-based executable per module: tests/test_<name>.cpp
-foreach(name orderbook id_index event_loop ring venue oms risk)
+foreach(name orderbook id_index event_loop ring venue oms risk itch)
   add_executable(test_${name} tests/test_${name}.cpp)
   add_test(NAME ${name} COMMAND test_${name})
 endforeach()
