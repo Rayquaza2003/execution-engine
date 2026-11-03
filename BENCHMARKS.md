@@ -142,3 +142,50 @@ There are no locks, allocations, or scans over orders. The kill flag is a relaxe
 (8.43 vs 8.49 ns).
 
 The order book bench is unchanged: checksum `2a79b8de12e4cd7d`, 0 hot-path allocations.
+
+## S5: market data from ITCH
+
+### Real data check
+
+Input is the first 300 MB of NASDAQ's public sample `01302019.NASDAQ_ITCH50.gz`. That
+decompresses to 751 MB: 22.4M book messages from 04:00 to 09:38 on 2019-01-30.
+
+- **Parser.** Every execute, cancel, delete and replace in the file names a live order with
+  enough shares. That makes 0 bad references across 22.4M messages. Timestamps never go
+  backwards.
+- **Replay.** I replayed AAPL, MSFT, SPY, QQQ and TSLA and wrote 32,369 one-second bars. None
+  of them shows a crossed or locked book. Of the 725,124 messages for these symbols, 75 were
+  dropped. Those are stub quotes outside the book's price band, and later messages for the
+  same orders.
+
+### Throughput
+
+`bench_md` uses a synthetic feed: 5M messages, 8 symbols, about 1000 resting orders per
+symbol. Each row is the median of 5 passes, and the medians held over 5 runs:
+
+| stage                                     | M msgs/s | ns/msg |
+|-------------------------------------------|---------:|-------:|
+| parse only                                | 85.4     | 12     |
+| + replay into the venue's order books     | 14.3     | 70     |
+| + client L2 books, NBBO, 1 s bars         | 7.3      | 137    |
+
+The client L2 book costs as much as the matching book. It is a `std::map` per side, so it
+allocates per price level and chases pointers. The upgrade path is the same flat price ladder
+`OrderBook` uses. This is marked with a `ponytail:` comment in `market_data.hpp`.
+
+End to end on the real file, `itch_replay` does the following in 0.61 s, which is
+**36.9 M msgs/s** (median of 5 runs):
+
+- reads all 751 MB
+- parses every message
+- books the 5 symbols
+- writes the CSV
+
+Most messages belong to other symbols and are skipped after the parse.
+
+One bug showed up while measuring. Reserving 1M orders per symbol made each id table about
+32 MB, and random lookups into it missed cache. The default capacity grows on demand instead,
+and the final books came out identical. The timing difference was 0.74 vs 0.61 s, but those
+were single noisy runs.
+
+The order book checksum is still `2a79b8de12e4cd7d`.
