@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <functional>
 #include <map>
+#include <optional>
 #include <unordered_map>
 #include <variant>
 #include <vector>
@@ -201,6 +202,37 @@ public:
         }
     }
 
+    // Replay mode: rebuild a real venue's book from its order-by-order feed
+    // (ITCH). Feed orders have no owner, so they get no execution reports;
+    // level updates and trade prints come out exactly as for live orders.
+    // Halts and stops are the real venue's business and are not re-run.
+
+    // False if the book refuses the order (out of band, duplicate id).
+    bool replay_add(SymbolId s, OrderId id, Side side, Price px, Qty qty, VenueOut& out) {
+        OrderResult r = books_[s].limit(id, side, px, qty, trades_, Tif::Gtc);
+        fills(s, id, qty, out);  // a feed never crosses itself; only our own orders could be hit
+        flush_levels(s, out);
+        return bool(r);
+    }
+
+    // The feed says a resting order traded. Prints at px, or at the order's
+    // own price if px is empty; non-printable executions move the book only.
+    OrderBook::Reduced replay_execute(SymbolId s, OrderId id, Qty qty, std::optional<Price> px,
+                                      bool printable, VenueOut& out) {
+        OrderBook::Reduced r = books_[s].reduce(id, qty);
+        if (r.qty && printable)
+            print(s, px.value_or(r.price), r.qty, r.side == Side::Buy ? Side::Sell : Side::Buy, out);
+        flush_levels(s, out);
+        return r;
+    }
+
+    // Partial cancel, or delete when qty covers what is left.
+    OrderBook::Reduced replay_cancel(SymbolId s, OrderId id, Qty qty, VenueOut& out) {
+        OrderBook::Reduced r = books_[s].reduce(id, qty);
+        flush_levels(s, out);
+        return r;
+    }
+
 private:
     // Per-symbol state the book doesn't own: last trade and the stop book.
     struct Sym {
@@ -313,12 +345,16 @@ private:
             left -= t.qty;
             report(out, aggressor, sym, ExecType::Trade, Reject::None, t.price, t.qty, left);
             report(out, resting, sym, ExecType::Trade, Reject::None, t.price, t.qty, b.leaves(resting));
-            out.prints.push_back({sym, t.price, t.qty, buy ? Side::Buy : Side::Sell});
-            syms_[sym].recent.push(out.prints.back());
-            syms_[sym].has_last = true;
-            syms_[sym].last = t.price;
+            print(sym, t.price, t.qty, buy ? Side::Buy : Side::Sell, out);
         }
         trades_.clear();
+    }
+
+    void print(SymbolId sym, Price px, Qty qty, Side aggressor, VenueOut& out) {
+        out.prints.push_back({sym, px, qty, aggressor});
+        syms_[sym].recent.push(out.prints.back());
+        syms_[sym].has_last = true;
+        syms_[sym].last = px;
     }
 
     void flush_levels(SymbolId sym, VenueOut& out) {
