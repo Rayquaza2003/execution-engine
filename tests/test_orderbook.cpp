@@ -374,9 +374,26 @@ static void test_reduce_keeps_priority() {
     assert(b.reduce(42, 1).qty == 0);
 }
 
+static void test_peek_and_queue() {
+    OrderBook b;
+    std::vector<Trade> t;
+    b.limit(1, Side::Buy, 100, 10, t);
+    b.limit(2, Side::Buy, 100, 5, t);
+    b.limit(3, Side::Buy, 99, 7, t);
+    b.limit(4, Side::Sell, 100, 4, t);  // fills 4 of order 1
+    OrderBook::Reduced r = b.peek(1);
+    assert(r.side == Side::Buy && r.price == 100 && r.qty == 6 && b.peek(4).qty == 0 && b.peek(42).qty == 0);
+    std::vector<std::pair<OrderId, Qty>> q;
+    b.queue(Side::Buy, 100, [&](OrderId id, Qty n) { q.push_back({id, n}); });
+    assert((q == std::vector<std::pair<OrderId, Qty>>{{1, 6}, {2, 5}}));
+    b.queue(Side::Sell, 100, [&](OrderId, Qty) { assert(false); });
+    b.queue(Side::Buy, 1 << 30, [&](OrderId, Qty) { assert(false); });  // outside the ladder
+}
+
 int main() {
     test_reduce_keeps_priority();
     test_leaves();
+    test_peek_and_queue();
     test_self_trade_prevention();
     test_ioc();
     test_fok();

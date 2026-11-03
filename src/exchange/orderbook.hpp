@@ -169,6 +169,20 @@ public:
         return o == IdIndex::kMissing ? 0 : pool_[o].qty;
     }
 
+    // Side, price and remaining quantity of a live order; qty 0 if it is not on the book.
+    Reduced peek(OrderId id) const {
+        uint32_t o = index_.find(id);
+        if (o == IdIndex::kMissing) return {Side::Buy, 0, 0};
+        return {pool_[o].side, pool_[o].price, pool_[o].qty};
+    }
+
+    // Calls f(id, qty) for each order resting at px, front of the queue first (L3 view).
+    template <class F>
+    void queue(Side side, Price px, F&& f) const {
+        const Level* q = (side == Side::Buy ? bids_ : asks_).find(px);
+        for (uint32_t o = q ? q->head : kNil; o != kNil; o = pool_[o].next) f(pool_[o].id, pool_[o].qty);
+    }
+
     // Up to n non-empty levels from the best price outward (L2 snapshot).
     std::vector<LevelChange> top(Side side, size_t n) const {
         const Ladder& L = side == Side::Buy ? bids_ : asks_;
