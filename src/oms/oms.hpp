@@ -7,6 +7,7 @@
 #include "core/id_index.hpp"
 #include "core/types.hpp"
 #include "exchange/venue.hpp"
+#include "risk/risk.hpp"
 
 // Order lifecycle as seen by the trading firm.
 //
@@ -166,10 +167,14 @@ struct OmsFill {
 // requests and venue execution reports into order state, enforcing the state
 // machine above. Pure: requests go out through a vector, reports come in
 // through on_report, and the caller owns transport and timing.
+//
+// With a Risk attached, every new order and replace is checked before it
+// leaves. A refusal comes back as a Rejected / ReplaceRejected report with the
+// risk reason, through the same path as a venue reply.
 class Oms {
 public:
-    Oms(AccountId account, OrderId id_base, size_t expected = 1 << 16)
-        : account_(account), base_(id_base), by_cl_(expected) {}
+    Oms(AccountId account, OrderId id_base, Risk* risk = nullptr, size_t expected = 1 << 16)
+        : account_(account), base_(id_base), risk_(risk), by_cl_(expected) {}
 
     void set_time(Nanos now) { now_ = now; }
 
@@ -187,8 +192,17 @@ public:
         OrderId id = base_ + slot;
         orders_.push_back({c.cl, id, c.sym, c.side, c.type, c.tif, c.px, c.stop_px, c.qty});
         by_cl_.insert(c.cl, slot);
+        OmsOrder& o = orders_.back();
+        if (risk_) {
+            Reject why = risk_->check(c.sym, c.side, c.type, c.px, c.qty);
+            if (why != Reject::None) {
+                apply(o, {id, c.sym, ExecType::Rejected, why, 0, 0, 0});
+                return {o, false};
+            }
+            risk_->on_new(c.sym, c.side, c.qty);
+        }
         out.push_back(NewOrder{id, account_, c.sym, c.side, c.type, c.tif, c.px, c.qty, c.stop_px});
-        return {orders_.back(), false};
+        return {o, false};
     }
 
     // False if the order is unknown or its state forbids it (terminal, or
@@ -200,11 +214,21 @@ public:
         return true;
     }
 
-    // qty is the new open quantity (the venue's replace semantics).
+    // qty is the new open quantity (the venue's replace semantics). False also
+    // when risk refuses it; the order stays as it was, with last_reject set.
     // ponytail: FIX replaces carry total OrderQty; convert at the gateway in S10.
+    // ponytail: risk keeps the old open qty until Replaced arrives, so an upsize
+    // in flight is briefly undercounted; reserve max(old, new) if that matters.
     bool replace(ClOrdId cl, Price px, Qty qty, std::vector<VenueRequest>& out) {
         OmsOrder* o = find_mut(cl);
         if (!o || !step(*o, OrdEvent::ReplaceReq)) return false;
+        if (risk_) {
+            Reject why = risk_->check(o->sym, o->side, o->type, px, qty, o->leaves);
+            if (why != Reject::None) {
+                apply(*o, {o->id, o->sym, ExecType::ReplaceRejected, why, 0, 0, 0});
+                return false;
+            }
+        }
         o->pending_px = px;
         o->pending_qty = qty;
         out.push_back(ReplaceRequest{o->id, o->sym, px, qty});
@@ -217,34 +241,15 @@ public:
             return;
         }
         OmsOrder& o = orders_[r.id - base_];
-        if (!step(o, event_of(r))) {
+        Qty before = o.leaves;
+        bool was_open = !is_terminal(o.state);
+        if (!apply(o, r)) {
             ++invalid_;
             return;
         }
-        switch (r.type) {
-            case ExecType::Trade:
-                o.cum += r.last_qty;
-                o.leaves = r.leaves;
-                o.notional += double(r.last_px) * double(r.last_qty);
-                fills_.push_back({now_, o.cl, o.id, o.sym, o.side, r.last_px, r.last_qty});
-                break;
-            case ExecType::Replaced:
-                o.px = o.pending_px;
-                o.leaves = r.leaves;
-                break;
-            case ExecType::Cancelled:
-            case ExecType::Expired:
-            case ExecType::Rejected:
-                o.leaves = 0;
-                o.last_reject = r.reason;
-                break;
-            case ExecType::CancelRejected:
-            case ExecType::ReplaceRejected:
-                o.last_reject = r.reason;
-                break;
-            case ExecType::New:
-            case ExecType::Triggered:
-                break;
+        if (risk_) {
+            if (r.type == ExecType::Trade) risk_->on_fill(o.sym, o.side, r.last_px, r.last_qty);
+            risk_->on_leaves(o.sym, o.side, before, o.leaves, was_open && is_terminal(o.state));
         }
     }
 
@@ -281,6 +286,38 @@ private:
         return true;
     }
 
+    // State transition plus its effects. False (nothing changed) if the state
+    // machine refuses the report.
+    bool apply(OmsOrder& o, const ExecReport& r) {
+        if (!step(o, event_of(r))) return false;
+        switch (r.type) {
+            case ExecType::Trade:
+                o.cum += r.last_qty;
+                o.leaves = r.leaves;
+                o.notional += double(r.last_px) * double(r.last_qty);
+                fills_.push_back({now_, o.cl, o.id, o.sym, o.side, r.last_px, r.last_qty});
+                break;
+            case ExecType::Replaced:
+                o.px = o.pending_px;
+                o.leaves = r.leaves;
+                break;
+            case ExecType::Cancelled:
+            case ExecType::Expired:
+            case ExecType::Rejected:
+                o.leaves = 0;
+                o.last_reject = r.reason;
+                break;
+            case ExecType::CancelRejected:
+            case ExecType::ReplaceRejected:
+                o.last_reject = r.reason;
+                break;
+            case ExecType::New:
+            case ExecType::Triggered:
+                break;
+        }
+        return true;
+    }
+
     OmsOrder* find_mut(ClOrdId cl) {
         uint32_t slot = by_cl_.find(cl);
         return slot == IdIndex::kMissing ? nullptr : &orders_[slot];
@@ -288,6 +325,7 @@ private:
 
     AccountId account_;
     OrderId base_;
+    Risk* risk_;  // optional, not owned
     Nanos now_ = 0;
     std::deque<OmsOrder> orders_;  // deque: references stay valid as orders are added
     IdIndex by_cl_;                // ClOrdId -> slot in orders_

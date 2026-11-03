@@ -1,7 +1,9 @@
 #undef NDEBUG  // keep asserts on in Release builds
 #include <cassert>
 #include <cstdio>
+#include <random>
 
+#include "oms/oms.hpp"
 #include "risk/risk.hpp"
 
 constexpr Side B = Side::Buy;
@@ -93,11 +95,126 @@ static void test_kill_switch_blocks_everything() {
     assert(r.check(5, B, L, 10, 1) == Reject::KillSwitch);  // checked first
 }
 
+// OMS with risk attached, wired to a real venue. Counterparties use ids
+// below the OMS range and account 0.
+struct Rig {
+    Venue v;
+    SymbolId s = v.add_symbol();
+    Risk risk;
+    Oms oms{7, 1'000'000, &risk};
+    std::vector<VenueRequest> req;
+    VenueOut out;
+
+    explicit Rig(RiskLimits lim = {}) : risk(1, lim) { risk.mark(s, 100); }
+    void send() {
+        for (const VenueRequest& r : req) v.on_request(r, out);
+        req.clear();
+        deliver();
+    }
+    void deliver() {
+        for (const ExecReport& rep : out.reports) oms.on_report(rep);
+        for (const TradePrint& p : out.prints) risk.mark(p.sym, p.price);
+        out.clear();
+    }
+    void other(OrderId id, Side side, Price px, Qty qty) {
+        v.on_new({id, 0, s, side, L, Tif::Day, px, qty}, out);
+        deliver();
+    }
+    const OmsOrder& o(ClOrdId cl) const { return *oms.find(cl); }
+    ClientOrder lim(ClOrdId cl, Side side, Price px, Qty qty) const {
+        return {cl, s, side, L, Tif::Day, px, qty};
+    }
+};
+
+static void test_risk_rejects_come_back_as_reports() {
+    RiskLimits lim;
+    lim.max_order_qty = 50;
+    lim.max_position = 45;
+    Rig r(lim);
+    r.oms.submit(r.lim(1, B, 100, 51), r.req);
+    assert(r.req.empty() && r.o(1).state == OrdState::Rejected);
+    assert(r.o(1).last_reject == Reject::MaxOrderQty && r.risk.open_orders() == 0);
+    assert(r.oms.submit(r.lim(1, B, 100, 5), r.req).duplicate);  // the ClOrdId is used up
+
+    r.oms.submit(r.lim(2, B, 100, 40), r.req);
+    r.send();
+    assert(r.o(2).state == OrdState::Acknowledged && r.risk.open_qty(r.s, B) == 40);
+    assert(!r.oms.replace(2, 100, 46, r.req) && r.req.empty());
+    assert(r.o(2).state == OrdState::Acknowledged && r.o(2).last_reject == Reject::MaxPosition);
+    assert(r.oms.replace(2, 100, 45, r.req));
+    r.send();
+    assert(r.o(2).leaves == 45 && r.risk.open_qty(r.s, B) == 45 && r.oms.invalid_transitions() == 0);
+}
+
+static void test_risk_tracks_fills_and_cancels() {
+    Rig r;
+    r.oms.submit(r.lim(1, B, 100, 10), r.req);
+    r.oms.submit(r.lim(2, Sl, 103, 5), r.req);
+    r.send();
+    r.other(1, Sl, 100, 4);  // we buy 4 @ 100
+    assert(r.risk.position(r.s) == 4 && r.risk.open_qty(r.s, B) == 6 && r.risk.open_orders() == 2);
+    r.other(2, B, 103, 5);  // we sell 5 @ 103, mark moves to 103
+    assert(r.risk.position(r.s) == -1 && r.risk.open_orders() == 1);
+    assert(r.risk.pnl() == 4 * 3);  // bought 4 at 100, sold 5 at 103, short 1 marked at 103
+    r.oms.cancel(1, r.req);
+    r.send();
+    assert(r.risk.open_qty(r.s, B) == 0 && r.risk.open_orders() == 0);
+}
+
+// Random flow: after every step, risk's running totals must equal what the
+// OMS order states say. Catches any open-qty or count update that goes missing.
+static void test_risk_totals_match_oms_under_random_flow() {
+    RiskLimits lim;
+    lim.max_position = 300;
+    lim.max_open_orders = 20;
+    lim.collar_bps = 300;
+    Rig r(lim);
+    std::mt19937_64 rng(7);
+    auto uni = [&](int lo, int hi) { return std::uniform_int_distribution<int>(lo, hi)(rng); };
+    ClOrdId next_cl = 1;
+    OrderId next_other = 1;
+    size_t rejected = 0;
+
+    for (int i = 0; i < 5000; ++i) {
+        Side side = uni(0, 1) ? B : Sl;
+        Price px = 100 + uni(-4, 4);
+        switch (uni(0, 9)) {
+            case 0: case 1: case 2: {
+                const OmsOrder& o = r.oms.submit(r.lim(next_cl++, side, px, uni(1, 40)), r.req).order;
+                rejected += o.state == OrdState::Rejected;
+                break;
+            }
+            case 3: r.oms.cancel(ClOrdId(uni(1, int(next_cl))), r.req); break;
+            case 4: r.oms.replace(ClOrdId(uni(1, int(next_cl))), px, uni(1, 40), r.req); break;
+            default: r.other(next_other++, side, px, uni(1, 30)); break;
+        }
+        if (uni(0, 2) == 0) r.send();  // let requests pile up so races happen
+
+        int64_t pos = 0;
+        Qty open_b = 0, open_s = 0;
+        size_t live = 0;
+        for (ClOrdId cl = 1; cl < next_cl; ++cl) {
+            const OmsOrder& o = r.o(cl);
+            pos += o.side == B ? int64_t(o.cum) : -int64_t(o.cum);
+            if (is_terminal(o.state)) continue;
+            ++live;
+            (o.side == B ? open_b : open_s) += o.leaves;
+        }
+        assert(r.risk.position(r.s) == pos && r.risk.open_orders() == live);
+        assert(r.risk.open_qty(r.s, B) == open_b && r.risk.open_qty(r.s, Sl) == open_s);
+        assert(open_b + std::max<int64_t>(pos, 0) <= 300 + 40);  // worst case held, give or take one replace upsize
+    }
+    assert(r.oms.invalid_transitions() == 0 && rejected > 0);
+}
+
 int main() {
     test_each_limit_and_its_boundary();
     test_position_counts_open_orders_worst_case();
     test_open_order_count();
     test_mark_to_market_pnl_and_loss_limit();
     test_kill_switch_blocks_everything();
+    test_risk_rejects_come_back_as_reports();
+    test_risk_tracks_fills_and_cancels();
+    test_risk_totals_match_oms_under_random_flow();
     std::puts("all tests passed");
 }
