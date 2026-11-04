@@ -85,8 +85,8 @@ throughput implies about 34 ns/op on average. Sub-tick precision needs `rdtsc` o
   a dense book. The ladder grows and recenters on demand. A price band (`kMaxSpan`) bounds its
   memory.
 - **Order id lookup** uses open addressing with linear probing, Fibonacci hashing, a load factor
-  of at most 1/2, and backward-shift deletion with no tombstones. `test.cpp` checks it against
-  `std::unordered_map` over 200k random operations.
+  of at most 1/2, and backward-shift deletion with no tombstones. `tests/test_id_index.cpp`
+  checks it against `std::unordered_map` over 200k random operations.
 
 ## S2: exchange features on the hot path
 

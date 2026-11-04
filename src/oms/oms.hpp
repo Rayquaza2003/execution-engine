@@ -218,7 +218,7 @@ public:
 
     // qty is the new open quantity (the venue's replace semantics). False also
     // when risk refuses it; the order stays as it was, with last_reject set.
-    // ponytail: FIX replaces carry total OrderQty; convert at the gateway in S10.
+    // (FIX's OrderQty on a replace is the total including fills; the gateway converts.)
     // ponytail: risk keeps the old open qty until Replaced arrives, so an upsize
     // in flight is briefly undercounted; reserve max(old, new) if that matters.
     bool replace(ClOrdId cl, Price px, Qty qty, std::vector<VenueRequest>& out) {
