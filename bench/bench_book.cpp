@@ -15,7 +15,17 @@ using Clock = std::chrono::steady_clock;
 // steady-state hot path allocates nothing. Kept out of line: if GCC inlines it,
 // it sees malloc behind every container growth and its object-size analysis
 // raises false -Wstringop-overflow warnings inside the order book.
+// ThreadSanitizer brings its own operator new (statically, with clang on
+// Linux), so under TSan there is no count: the bench reports 0 there.
 static size_t g_allocs = 0;
+#if defined(__SANITIZE_THREAD__)
+#define NO_ALLOC_COUNT
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define NO_ALLOC_COUNT
+#endif
+#endif
+#ifndef NO_ALLOC_COUNT
 [[gnu::noinline]] void* operator new(size_t n) {
     ++g_allocs;
     if (void* p = std::malloc(n ? n : 1)) return p;
@@ -23,6 +33,7 @@ static size_t g_allocs = 0;
 }
 void operator delete(void* p) noexcept { std::free(p); }
 void operator delete(void* p, size_t) noexcept { std::free(p); }
+#endif
 
 enum class OpType : uint8_t { Limit, Market, Cancel, Modify };
 
