@@ -93,6 +93,8 @@ static void test_kill_switch_blocks_everything() {
     r.kill();
     assert(r.killed() && r.check(0, B, L, 10, 1) == Reject::KillSwitch);
     assert(r.check(5, B, L, 10, 1) == Reject::KillSwitch);  // checked first
+    r.resume();
+    assert(!r.killed() && r.check(0, B, L, 10, 1) == Reject::None);
 }
 
 // OMS with risk attached, wired to a real venue. Counterparties use ids

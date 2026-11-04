@@ -76,6 +76,9 @@ public:
 
     // Callable from any thread. Relaxed: the flag publishes no other data.
     void kill() { killed_.store(true, std::memory_order_relaxed); }
+    // Re-arm after a kill: a deliberate step, never automatic. Orders the kill
+    // cancelled stay cancelled; new ones are checked normally again.
+    void resume() { killed_.store(false, std::memory_order_relaxed); }
     bool killed() const { return killed_.load(std::memory_order_relaxed); }
 
     int64_t position(SymbolId sym) const { return syms_[sym].pos; }
