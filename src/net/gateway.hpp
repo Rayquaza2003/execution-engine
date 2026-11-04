@@ -271,6 +271,9 @@ private:
             nonblocking(fd);
             int one = 1;
             setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);  // no Nagle: send each message now
+#ifdef SO_NOSIGPIPE
+            setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);  // macOS: a closed peer is an error, not a signal
+#endif
             conns_.push_back(std::make_unique<Conn>(Conn{fd, -1, {}}));
         }
     }
@@ -324,7 +327,7 @@ private:
         if (!c) return;
         std::string& out = c->s.output();
         while (!out.empty()) {
-            ssize_t n = write(conns_[i]->fd, out.data(), out.size());
+            ssize_t n = ::send(conns_[i]->fd, out.data(), out.size(), kNoSignal);
             if (n <= 0) {
                 if (errno != EAGAIN && errno != EWOULDBLOCK) return drop(i);
                 return;  // socket full: POLLOUT will bring us back
@@ -589,6 +592,11 @@ private:
     }
 
     static constexpr size_t kMaxPreLogon = 4096;
+#ifdef MSG_NOSIGNAL
+    static constexpr int kNoSignal = MSG_NOSIGNAL;  // Linux: writing to a closed peer must not kill the process
+#else
+    static constexpr int kNoSignal = 0;  // macOS: SO_NOSIGPIPE on the socket instead
+#endif
 
     std::vector<std::string> symbols_;
     std::string comp_;

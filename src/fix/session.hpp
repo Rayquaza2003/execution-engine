@@ -168,7 +168,7 @@ public:
         std::time_t s = std::time_t(t / 1'000'000'000);
         std::tm tm;
         gmtime_r(&s, &tm);
-        char b[32];
+        char b[64];  // 21 needed; room for any int, so no compiler can call it truncated
         std::snprintf(b, sizeof b, "%04d%02d%02d-%02d:%02d:%02d.%03d", tm.tm_year + 1900, tm.tm_mon + 1,
                       tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, int(t / 1'000'000 % 1000));
         return b;

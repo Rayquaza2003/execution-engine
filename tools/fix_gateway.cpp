@@ -16,6 +16,7 @@
 static std::atomic<bool> g_stop{false};
 
 int main(int argc, char** argv) {
+    std::signal(SIGPIPE, SIG_IGN);  // a peer hanging up is an error to handle, not a reason to die
     GatewayConfig cfg;
     int a = 1;
     for (; a < argc && argv[a][0] == '-'; ++a) {

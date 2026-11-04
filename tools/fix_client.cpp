@@ -12,6 +12,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <random>
@@ -24,6 +25,7 @@
 #include "net/gateway.hpp"
 
 int main(int argc, char** argv) {
+    std::signal(SIGPIPE, SIG_IGN);  // a peer hanging up is an error to handle, not a reason to die
     if (argc < 4) {
         std::fprintf(stderr, "usage: %s PORT SYMBOL COUNT [WINDOW]\n", argv[0]);
         return 2;

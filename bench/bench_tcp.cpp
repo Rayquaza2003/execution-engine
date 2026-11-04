@@ -8,6 +8,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <thread>
@@ -16,6 +17,7 @@
 #include "net/gateway.hpp"
 
 int main(int argc, char** argv) {
+    std::signal(SIGPIPE, SIG_IGN);  // a peer hanging up is an error to handle, not a reason to die
     int n = argc > 1 ? std::atoi(argv[1]) : 100'000;
     int l = socket(AF_INET, SOCK_STREAM, 0);
     sockaddr_in a{};

@@ -65,10 +65,10 @@ public:
                     return v;
                 };
                 std::tuple<A...> args{next.template operator()<A>()...};  // braces: left to right
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wformat-nonliteral"
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
                 std::apply([&](auto... x) { std::fprintf(f, r.fmt, x...); }, args);
-#pragma clang diagnostic pop
+#pragma GCC diagnostic pop
             }
             std::fputc('\n', f);
         }

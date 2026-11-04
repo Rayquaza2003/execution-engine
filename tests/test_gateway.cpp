@@ -1,5 +1,6 @@
 #undef NDEBUG  // keep asserts on in Release builds
 #include <cassert>
+#include <csignal>
 #include <cstdio>
 #include <map>
 #include <string>
@@ -428,6 +429,7 @@ static void test_big_gap_fill_does_not_deadlock() {
 }
 
 int main() {
+    std::signal(SIGPIPE, SIG_IGN);  // a peer hanging up is an error to handle, not a reason to die
     test_logon_needs_credentials_and_no_takeover();
     test_order_limits();
     test_flood_beyond_gap_is_cut_off();
