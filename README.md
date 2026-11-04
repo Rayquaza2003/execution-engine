@@ -73,13 +73,13 @@ Everything ran on an Apple M1 (8 GB, macOS) with Apple clang `-O3 -march=native`
 
 | what | measured | details |
 |---|---|---|
-| order book throughput | 29.6 M ops/s, up from 7.1 M for the `std::map` baseline (4.1x); 38.0 M at the final commit | [BENCHMARKS](BENCHMARKS.md#phase-3-one-change-at-a-time) |
+| order book throughput | about 30 M ops/s (29.6 M median), up from 7.1 M for the `std::map` baseline (4.1x) | [BENCHMARKS](BENCHMARKS.md#phase-3-one-change-at-a-time) |
 | order book allocations | 0 in steady state; every version gives the same trade checksum `2a79b8de12e4cd7d` | |
 | pre-trade risk check | 11 ns per order | [S4](BENCHMARKS.md#s4-pre-trade-risk-check) |
-| ITCH replay (real NASDAQ day, 751 MB) | 36.9 M msgs/s end to end; 0 bad references in 22.4M messages | [S5](BENCHMARKS.md#s5-market-data-from-itch) |
+| ITCH into order books | 70 ns per booked message (14.3 M msgs/s, synthetic feed). A full pass over the real 751 MB day runs at 36.9 M msgs/s, but only 3% of its 22.4M messages belong to the 5 booked symbols, so that figure is mostly parsing. 0 bad references. | [S5](BENCHMARKS.md#s5-market-data-from-itch) |
 | queue position | shortest vs longest fifth of queues fill within 1 s at 0.74 vs 0.46 (SPY); new-level joins lose 0.21 ticks more markout at 100 ms latency than at 0 | [research](research/README.md) |
-| execution algos, 170 paired real-data parents | Adaptive beats TWAP by 0.28 ± 0.10 bps | [research](research/README.md#execution-algos-and-tca-s7) |
-| smart order routing, 395 paired parents | beats best-price routing by 0.039 ± 0.004 bps, all of it fees, in 1 round instead of 2.4 | [research](research/README.md#smart-order-routing-s8) |
+| execution algos, 95 paired parents, out of sample | Adaptive beats TWAP by 0.29 bps (95% interval 0.05 to 0.53, errors clustered by start time) | [research](research/README.md#execution-algos-and-tca-s7) |
+| smart order routing, 245 paired parents, out of sample | beats best-price routing by 0.046 bps (0.036 to 0.056), all of it fees on venues I configured, in 1 round instead of 2.2 | [research](research/README.md#smart-order-routing-s8) |
 | SPSC queue vs mutex | round trip p50 215 ns vs 16.4 µs; p99.9 335 ns vs 524 µs | [S9](BENCHMARKS.md#s9-threads-queues-logger) |
 | async logger | 34 ns per call vs 270 ns for `fprintf` | |
 | FIX order round trip over TCP | p50 32 to 35 µs, against a 29.7 µs floor for bare TCP; 134 to 147k requests/s with 64 in flight | [S10](BENCHMARKS.md#s10-fix-gateway-over-tcp) |

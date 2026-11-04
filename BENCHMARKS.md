@@ -404,11 +404,18 @@ same session, so the TCP floor was lower that day than in S10.
 The journal is write-ahead. It is flushed before any byte reaches a socket, so a client never
 holds an acknowledgement the journal lacks.
 
-- Flushing to the OS adds one `write` syscall per loop pass, about 6 µs. That survives the
-  process crashing.
-- Surviving power loss as well needs `F_FULLFSYNC`, at about 4 ms per pass.
-- Group commit would amortize that across every request in a pass. The gateway already
-  flushes once per pass, not once per message.
+- Flushing to the OS costs one `write` syscall, about 6 µs, and survives the process
+  crashing.
+- Surviving power loss as well needs `F_FULLFSYNC`, at about 4 ms.
+- **When the gateway flushes.** It flushes once at the end of each loop pass. It also
+  flushes on the fast path, just before writing each new order's first execution report,
+  so that acknowledgement goes out without waiting for the end of the pass.
+  - With one request in flight (the rows above), that means one flush per order either way.
+  - With `--fsync` it means one `F_FULLFSYNC` per new order, so the 4.06 ms row is a
+    per-order sync, not group commit.
+- **Real group commit is not built.** It would sync once per batch and hold the
+  acknowledgements until then, which would spread the 4 ms across every request in the batch.
+  It is unmeasured.
 
 ### Crash drill
 
