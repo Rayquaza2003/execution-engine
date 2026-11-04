@@ -331,3 +331,71 @@ the client thought the order was still live. The gateway now tracks when an orde
 With 64 in flight, the latency is mostly queueing behind the 63 requests ahead.
 
 The order book checksum is still `2a79b8de12e4cd7d`.
+
+## S11: journal, recovery, reconciliation
+
+### Journal (`bench_journal`, 64-byte payload, APFS on the M1's SSD)
+
+Each record is a 16-byte header, then the payload, then a CRC32. Reading stops at the first
+record that is short or fails its CRC, and opening the journal for append cuts that torn tail
+off.
+
+| | ns per record |
+|---|---|
+| append, buffered in memory | 59 |
+| flush (`write`) every 64 records | 117 |
+| flush every record | 2,500 to 3,100 |
+| `F_FULLFSYNC` every 64 records | 66,000 to 75,000 |
+| `F_FULLFSYNC` every record | 3.8 to 4.3 ms |
+
+The first version computed the CRC a byte at a time, from a table, and an append cost 194 ns.
+ARMv8's `crc32` instructions compute the same CRC 8 bytes per instruction, and that brought
+it to 59 ns. The table version is kept as the fallback, and a test checks that the two agree.
+
+On macOS, plain `fsync` hands data to the drive but doesn't make the drive write its cache.
+Only `F_FULLFSYNC` survives power loss, and it costs about 4 ms.
+
+### What durability costs the FIX gateway
+
+These are wire-to-wire round trips with one request in flight. All rows were measured in the
+same session, so the TCP floor was lower that day than in S10.
+
+| gateway journal | wire to wire p50 | p99 | requests/s |
+|---|---|---|---|
+| none (bare TCP echo: 20.5 µs) | 21.5 µs | 78 µs | 33.5k |
+| flushed to the OS before each reply | 27.6 µs | 94 µs | 27.4k |
+| `F_FULLFSYNC` before each reply | 4.06 ms | 11 ms | 200 |
+
+The journal is write-ahead. It is flushed before any byte reaches a socket, so a client never
+holds an acknowledgement the journal lacks.
+
+- Flushing to the OS adds one `write` syscall per loop pass, about 6 µs. That survives the
+  process crashing.
+- Surviving power loss as well needs `F_FULLFSYNC`, at about 4 ms per pass.
+- Group commit would amortize that across every request in a pass. The gateway already
+  flushes once per pass, not once per message.
+
+### Crash drill
+
+The drill ran `fix_gateway --journal` with `fix_client` sending 400k requests, 64 in flight. The
+gateway was killed with `kill -9` after 1.5 s, which left a 78.6 MB journal. A restart with the
+same journal recovered 125,230 orders in 542 to 592 ms, about 4.5 µs per order. Two recoveries
+gave the same book digest and report checksum.
+
+The tests check the stronger property:
+
+- **Same state.** After recovery, the books, the matching engine's output checksum, the order
+  table and every FIX sequence number equal the crashed gateway's, even with a torn record at
+  the end of the journal.
+- **Reconnect.** A client reconnects without resetting its sequence numbers and keeps trading.
+- **Reconciliation.** A client that reconnects with a sequence reset has lost its missed fills
+  for good. It rebuilds them from an OrderMassStatusRequest (`Oms::reconcile`).
+
+### A bug only the sanitizer build caught
+
+The first recovery checksum hashed whole `ExecReport` and `LevelChange` structs, padding bytes
+included, and padding is uninitialized. Release builds happened to zero it, so live and
+recovered checksums matched by luck. The ASan build didn't, and the test failed there. Both
+hashes now go field by field.
+
+The order book checksum is still `2a79b8de12e4cd7d`.
