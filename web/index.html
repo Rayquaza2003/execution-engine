@@ -42,6 +42,15 @@
   .readout b { color: var(--ink); font-weight: 600; }
   .controls { display: flex; align-items: center; gap: 10px; margin-left: auto; flex-wrap: wrap; }
   .controls label { color: var(--muted); font-size: 13px; display: flex; align-items: center; gap: 6px; }
+  .controls .group { display: flex; align-items: center; gap: 10px; }
+  .controls .group[hidden] { display: none; }
+  .controls select { border: 1px solid var(--rule); border-radius: 6px; padding: 4px 6px; background: #fff; }
+  .clock b { font-size: 16px; font-weight: 650; color: var(--ink); }
+  .btn.play { border-color: var(--action); color: var(--action); font-weight: 600; min-width: 72px; }
+  .progress { width: 90px; height: 6px; border-radius: 3px; background: var(--rule); overflow: hidden; }
+  .progress span { display: block; height: 100%; background: var(--action); width: 0; }
+  .tabs button:disabled { opacity: 0.45; cursor: not-allowed; }
+  .replay-note { margin: 0 0 10px; font-size: 13px; color: var(--muted); max-width: 72ch; }
   .btn {
     border: 1px solid var(--rule); background: var(--panel); border-radius: 6px; padding: 5px 12px; cursor: pointer;
   }
@@ -134,6 +143,10 @@
 <body>
 <header>
   <h1>Engine test bench</h1>
+  <div class="tabs" id="mode" role="group" aria-label="Market">
+    <button type="button" data-mode="sim" aria-pressed="true">Simulated market</button>
+    <button type="button" data-mode="replay" aria-pressed="false">NASDAQ replay</button>
+  </div>
   <div class="tabs" id="tabs" role="group" aria-label="Symbol"></div>
   <div class="readout" aria-live="off">
     <span>Requests <b id="st-req">0</b></span>
@@ -141,11 +154,24 @@
     <span>Resting orders <b id="st-rest">0</b></span>
   </div>
   <div class="controls">
-    <label>Background flow
-      <input type="range" id="flow" min="0" max="5000" step="50" value="200" aria-describedby="flow-val">
-      <b id="flow-val">200/s</b>
-    </label>
-    <button class="btn" id="burst" title="Send 200,000 background orders as fast as the engine takes them">Run 200k-order burst</button>
+    <span class="group" id="sim-controls">
+      <label>Background flow
+        <input type="range" id="flow" min="0" max="5000" step="50" value="200" aria-describedby="flow-val">
+        <b id="flow-val">200/s</b>
+      </label>
+      <button class="btn" id="burst" title="Send 200,000 background orders as fast as the engine takes them">Run 200k-order burst</button>
+    </span>
+    <span class="group" id="replay-controls" hidden>
+      <span class="clock" title="Exchange time in the file (New York)"><b id="clock">09:30:00.000</b></span>
+      <button class="btn play" id="play">Play</button>
+      <label>Speed
+        <select id="speed">
+          <option value="1">Real time</option><option value="10">10×</option><option value="60">60×</option>
+          <option value="600">600×</option><option value="0">As fast as possible</option>
+        </select>
+      </label>
+      <span class="progress" title="How far through the file"><span id="progress-bar"></span></span>
+    </span>
     <button class="btn" id="reset">Reset session</button>
     <button class="btn kill" id="kill" aria-pressed="false">Kill switch</button>
   </div>
@@ -194,6 +220,7 @@
       <h2 id="ladder-h">Book</h2>
       <p id="spread"></p>
     </div>
+    <p class="replay-note" id="replay-note" hidden>The real NASDAQ book for 2019-01-30, rebuilt order by order from ITCH. Your orders queue behind the real ones and fill when real executions reach them. The market doesn't react to you.</p>
     <table class="ladder" aria-describedby="ladder-h">
       <thead><tr><th class="mine b">Yours</th><th class="r">Bids</th><th class="price">Price</th><th class="l">Asks</th><th class="mine s">Yours</th></tr></thead>
       <tbody id="ladder"></tbody>
@@ -231,7 +258,9 @@ const $ = id => document.getElementById(id);
 const money = v => v == null ? "–" : v.toFixed(2);
 const int = v => v == null ? "–" : v.toLocaleString("en-US");
 const ns = v => v >= 1000 ? (v / 1000).toFixed(1) + " µs" : v + " ns";
-const time = ms => new Date(ms).toLocaleTimeString("en-GB", { hour12: false }) + "." + String(ms % 1000).padStart(3, "0");
+// All times arrive as ms since midnight: the file's clock in replay, the local clock otherwise.
+const pad = (v, n) => String(v).padStart(n, "0");
+const time = ms => `${pad(Math.floor(ms / 3600000), 2)}:${pad(Math.floor(ms / 60000) % 60, 2)}:${pad(Math.floor(ms / 1000) % 60, 2)}.${pad(ms % 1000, 3)}`;
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
 let sym = 0, symbols = [], lastTape = null, editing = null, priceTouched = false;
@@ -310,6 +339,21 @@ $("burst").addEventListener("click", async () => {
   await post("/api/burst", { n: 200000 });
   $("burst").disabled = false;
 });
+// Market source and replay controls
+$("mode").addEventListener("click", async e => {
+  const b = e.target.closest("button[data-mode]");
+  if (!b || b.disabled || b.getAttribute("aria-pressed") === "true") return;
+  say(b.dataset.mode === "replay" ? "Loading the NASDAQ file up to 09:30…" : "Starting a simulated market…", false);
+  const err = await post("/api/mode", { mode: b.dataset.mode });
+  sym = 0; priceTouched = false; lastTape = null;
+  say(err || (b.dataset.mode === "replay" ? "Replay ready at 09:30. Press Play." : "Simulated market running."), !!err);
+});
+let playing = false;
+$("play").addEventListener("click", async () => {
+  const err = await post("/api/replay", { play: playing ? 0 : 1, speed: $("speed").value });
+  if (err) say(err, true);
+});
+$("speed").addEventListener("change", () => post("/api/replay", { speed: $("speed").value }));
 $("reset").addEventListener("click", async () => { await post("/api/reset", {}); lastTape = null; say("New session: books, orders and risk start fresh.", false); });
 // One button, two deliberate steps: kill cancels everything and blocks new
 // orders; resume only unblocks new orders (nothing cancelled comes back).
@@ -326,6 +370,22 @@ $("kill").addEventListener("click", async () => {
 
 function render(s) {
   symbols = s.symbols;
+  const replay = s.mode === "replay";
+  document.querySelectorAll("#mode button").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.mode === s.mode)));
+  const rb = document.querySelector('#mode button[data-mode="replay"]');
+  rb.disabled = !s.replay.available;
+  rb.title = s.replay.available ? "Rebuild the books from the NASDAQ ITCH file and play it" : "Start web_ui with --itch FILE SYMBOL... to enable";
+  $("sim-controls").hidden = replay;
+  $("replay-controls").hidden = !replay;
+  $("replay-note").hidden = !replay;
+  if (replay) {
+    playing = s.replay.playing;
+    $("play").textContent = s.replay.end ? "Ended" : playing ? "Pause" : "Play";
+    $("play").disabled = s.replay.end;
+    $("clock").textContent = time(s.replay.clock);
+    $("progress-bar").style.width = s.replay.progress + "%";
+    if (document.activeElement !== $("speed")) $("speed").value = String(s.replay.speed === 0 ? 0 : s.replay.speed);
+  }
   $("tabs").innerHTML = s.symbols.map((n, i) => `<button type="button" data-i="${i}" aria-pressed="${i === s.sym}">${esc(n)}</button>`).join("");
   $("st-req").textContent = int(s.stats.requests);
   $("st-p50").textContent = ns(s.stats.p50); $("st-p99").textContent = ns(s.stats.p99); $("st-p999").textContent = ns(s.stats.p999);
