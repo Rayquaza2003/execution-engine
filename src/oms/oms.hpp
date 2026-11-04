@@ -151,6 +151,7 @@ struct OmsOrder {
     Reject last_reject = Reject::None;
     Price pending_px = 0;  // replace in flight
     Qty pending_qty = 0;
+    Qty reserved = 0;      // an upsize in flight, held against risk until the venue answers
 
     double avg_px() const { return cum ? notional / double(cum) : 0.0; }
 };
@@ -219,8 +220,9 @@ public:
     // qty is the new open quantity (the venue's replace semantics). False also
     // when risk refuses it; the order stays as it was, with last_reject set.
     // (FIX's OrderQty on a replace is the total including fills; the gateway converts.)
-    // ponytail: risk keeps the old open qty until Replaced arrives, so an upsize
-    // in flight is briefly undercounted; reserve max(old, new) if that matters.
+    // An upsize counts against risk the moment it is sent (the venue may well
+    // accept it), not when the venue says so; a downsize only frees quantity
+    // once the venue confirms it.
     bool replace(ClOrdId cl, Price px, Qty qty, std::vector<VenueRequest>& out) {
         OmsOrder* o = find_mut(cl);
         if (!o || !step(*o, OrdEvent::ReplaceReq)) return false;
@@ -233,6 +235,10 @@ public:
         }
         o->pending_px = px;
         o->pending_qty = qty;
+        if (qty > o->leaves) {
+            o->reserved = qty - o->leaves;
+            if (risk_) risk_->on_leaves(o->sym, o->side, o->leaves, qty, false);
+        }
         out.push_back(ReplaceRequest{o->id, o->sym, px, qty});
         return true;
     }
@@ -243,15 +249,17 @@ public:
             return;
         }
         OmsOrder& o = orders_[r.id - base_];
-        Qty before = o.leaves;
+        Qty before = o.leaves + o.reserved;  // what risk is holding for this order
         bool was_open = !is_terminal(o.state);
         if (!apply(o, r)) {
             ++invalid_;
             return;
         }
+        if (r.type == ExecType::Replaced || r.type == ExecType::ReplaceRejected || is_terminal(o.state))
+            o.reserved = 0;  // the replace is answered (or moot)
         if (risk_) {
             if (r.type == ExecType::Trade) risk_->on_fill(o.sym, o.side, r.last_px, r.last_qty);
-            risk_->on_leaves(o.sym, o.side, before, o.leaves, was_open && is_terminal(o.state));
+            risk_->on_leaves(o.sym, o.side, before, o.leaves + o.reserved, was_open && is_terminal(o.state));
         }
     }
 
@@ -290,7 +298,8 @@ public:
         size_t changed = 0;
         for (OmsOrder& o : orders_) {
             bool was_open = !is_terminal(o.state);
-            Qty before = o.leaves;
+            Qty before = o.leaves + o.reserved;
+            o.reserved = 0;  // the venue's answer replaces whatever was in flight
             auto it = by.find(o.cl);
             if (it == by.end()) {
                 if (!was_open) continue;

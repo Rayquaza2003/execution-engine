@@ -161,6 +161,28 @@ static void test_risk_tracks_fills_and_cancels() {
     assert(r.risk.open_qty(r.s, B) == 0 && r.risk.open_orders() == 0);
 }
 
+// Two upsizes in flight at once must not together break the position limit:
+// the first one's extra quantity is held against risk as soon as it is sent.
+static void test_replace_upsizes_in_flight_are_reserved() {
+    RiskLimits lim;
+    lim.max_position = 100;
+    Rig r(lim);
+    r.oms.submit(r.lim(1, B, 99, 40), r.req);
+    r.oms.submit(r.lim(2, B, 99, 40), r.req);
+    r.send();
+    assert(r.risk.open_qty(r.s, B) == 80);
+    assert(r.oms.replace(1, 99, 60, r.req));       // 80 - 40 + 60 = 100: allowed, and reserved now
+    assert(r.risk.open_qty(r.s, B) == 100 && r.o(1).reserved == 20);
+    assert(!r.oms.replace(2, 99, 60, r.req));      // would be 120 if both landed
+    assert(r.o(2).last_reject == Reject::MaxPosition);
+    r.send();                                       // the first replace lands
+    assert(r.o(1).leaves == 60 && r.o(1).reserved == 0 && r.risk.open_qty(r.s, B) == 100);
+    assert(r.oms.replace(1, 99, 10, r.req));       // a downsize frees nothing until confirmed
+    assert(r.risk.open_qty(r.s, B) == 100);
+    r.send();
+    assert(r.risk.open_qty(r.s, B) == 50 && r.oms.invalid_transitions() == 0);
+}
+
 static void test_kill_switch_cancels_everything_working() {
     Rig r;
     r.oms.submit(r.lim(1, B, 99, 10), r.req);
@@ -180,13 +202,13 @@ static void test_kill_switch_cancels_everything_working() {
 
 // Random flow: after every step, risk's running totals must equal what the
 // OMS order states say. Catches any open-qty or count update that goes missing.
-static void test_risk_totals_match_oms_under_random_flow() {
+static void test_risk_totals_match_oms_under_random_flow(uint64_t seed) {
     RiskLimits lim;
     lim.max_position = 300;
     lim.max_open_orders = 20;
     lim.collar_bps = 300;
     Rig r(lim);
-    std::mt19937_64 rng(7);
+    std::mt19937_64 rng(seed);
     auto uni = [&](int lo, int hi) { return std::uniform_int_distribution<int>(lo, hi)(rng); };
     ClOrdId next_cl = 1;
     OrderId next_other = 1;
@@ -215,11 +237,12 @@ static void test_risk_totals_match_oms_under_random_flow() {
             pos += o.side == B ? int64_t(o.cum) : -int64_t(o.cum);
             if (is_terminal(o.state)) continue;
             ++live;
-            (o.side == B ? open_b : open_s) += o.leaves;
+            (o.side == B ? open_b : open_s) += o.leaves + o.reserved;
         }
         assert(r.risk.position(r.s) == pos && r.risk.open_orders() == live);
         assert(r.risk.open_qty(r.s, B) == open_b && r.risk.open_qty(r.s, Sl) == open_s);
-        assert(open_b + std::max<int64_t>(pos, 0) <= 300 + 40);  // worst case held, give or take one replace upsize
+        // The worst case risk checks, exactly: everything open filling, upsizes in flight included.
+        assert(int64_t(open_b) + pos <= 300 && int64_t(open_s) - pos <= 300);
     }
     assert(r.oms.invalid_transitions() == 0 && rejected > 0);
 }
@@ -233,6 +256,7 @@ int main() {
     test_risk_rejects_come_back_as_reports();
     test_risk_tracks_fills_and_cancels();
     test_kill_switch_cancels_everything_working();
-    test_risk_totals_match_oms_under_random_flow();
+    test_replace_upsizes_in_flight_are_reserved();
+    for (uint64_t seed = 1; seed <= 10; ++seed) test_risk_totals_match_oms_under_random_flow(seed);
     std::puts("all tests passed");
 }
