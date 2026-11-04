@@ -146,6 +146,54 @@ static void test_acceptor_learns_peer_from_logon() {
     assert(client.state() == Session::State::Active);
 }
 
+// The server dies and comes back from its own records. Its reply "y" never
+// reached the client; after reconnecting, the client sees the gap and gets
+// "y" resent from the rebuilt store. Sequence numbers carry on.
+static void test_restart_from_records() {
+    Pair p;
+    std::vector<std::pair<bool, std::string>> rec;
+    p.server.on_record = [&](bool out, std::string_view raw) { rec.push_back({out, std::string(raw)}); };
+    p.up();
+    p.order(p.client, "a");
+    p.pump();
+    p.order(p.server, "x");
+    p.pump();
+    p.order(p.server, "y");
+    p.server.output().clear();  // lost when the server crashed
+    uint64_t in = p.server.next_in(), out = p.server.next_out();
+
+    Session reborn({"EXCH", "", 30 * kSec, false});
+    for (auto& [o, raw] : rec) reborn.restore(o, raw);
+    assert(reborn.next_in() == in && reborn.next_out() == out && reborn.peer() == "CLIENT");
+    p.server = std::move(reborn);
+    p.client.reconnect();
+    p.client.logon(p.now);
+    p.pump();
+    assert(p.client.state() == Session::State::Active && p.server.state() == Session::State::Active);
+    assert((p.at_client == std::vector<std::string>{"x", "y"}) && p.client.gaps() == 1);
+    p.order(p.client, "b");
+    p.pump();
+    assert((p.at_server == std::vector<std::string>{"a", "b"}));
+}
+
+// ResetSeqNumFlag: both sides start again from 1 and nothing old is resent.
+static void test_reset_seq_num_logon() {
+    Pair p;
+    p.up();
+    p.order(p.client, "a");
+    p.order(p.server, "x");
+    p.pump();
+    p.client.reconnect();
+    p.server.reconnect();
+    p.client.logon(p.now, true);
+    p.pump();
+    assert(p.client.state() == Session::State::Active && p.server.state() == Session::State::Active);
+    assert(p.client.next_out() == 2 && p.client.next_in() == 2 && p.server.next_in() == 2 && p.server.next_out() == 2);
+    p.order(p.client, "b");
+    p.pump();
+    assert((p.at_server == std::vector<std::string>{"a", "b"}) && p.server.resent() == 0 && p.client.gaps() == 0);
+}
+
 static void test_logout_handshake_and_utc() {
     Pair p;
     p.up();
@@ -164,5 +212,7 @@ int main() {
     test_seq_too_low_logs_out();
     test_logout_handshake_and_utc();
     test_acceptor_learns_peer_from_logon();
+    test_restart_from_records();
+    test_reset_seq_num_logon();
     std::puts("all tests passed");
 }

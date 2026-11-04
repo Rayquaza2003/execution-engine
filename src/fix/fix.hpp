@@ -30,7 +30,7 @@ enum Tag : uint32_t {
     LastQty = 32, MsgSeqNum = 34, MsgType = 35, NewSeqNo = 36, OrderID = 37, OrderQty = 38, OrdStatus = 39,
     OrdType = 40, OrigClOrdID = 41, PossDupFlag = 43, Price = 44, SenderCompID = 49, SendingTime = 52,
     Side = 54, Symbol = 55, TargetCompID = 56, Text = 58, TimeInForce = 59, CxlRejReason = 102,
-    EncryptMethod = 98, HeartBtInt = 108, TestReqID = 112, OrigSendingTime = 122, GapFillFlag = 123,
+    EncryptMethod = 98, HeartBtInt = 108, ResetSeqNumFlag = 141, TestReqID = 112, OrigSendingTime = 122, GapFillFlag = 123,
     ExecType = 150, LeavesQty = 151, CxlRejResponseTo = 434,
 };
 
