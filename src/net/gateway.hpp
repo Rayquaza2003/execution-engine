@@ -344,7 +344,10 @@ private:
             if (out.reports.empty()) out.reports.push_back({});  // still close the request
             for (size_t i = 0; i < out.reports.size(); ++i) {
                 FromVenue f{out.reports[i], i + 1 < out.reports.size() || out.reports[i].id, i + 1 == out.reports.size()};
-                while (!from_venue_.try_push(f)) cpu_relax();
+                while (!from_venue_.try_push(f)) {
+                    if (stop.load(std::memory_order_relaxed)) return;
+                    cpu_relax();
+                }
             }
             out.clear();
         }
@@ -369,7 +372,18 @@ private:
             for (const ExecReport& e : reps) on_report(e, 0);
             return;
         }
-        while (!to_venue_.try_push({rq})) cpu_relax();
+        // The matcher may itself be waiting for room in from_venue_, which only
+        // this thread empties: keep emptying it while waiting, or both threads
+        // wait on each other forever.
+        while (!to_venue_.try_push({rq})) {
+            FromVenue r;
+            if (!from_venue_.try_pop(r)) {
+                cpu_relax();
+                continue;
+            }
+            inflight_ -= r.last;
+            if (r.has_rep) on_report(r.rep, now());
+        }
         ++inflight_;
     }
 

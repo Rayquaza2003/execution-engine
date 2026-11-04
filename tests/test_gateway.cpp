@@ -337,8 +337,63 @@ static void test_logon_needs_credentials_and_no_takeover() {
     assert(gw.auth_failures() == 4);
 }
 
+// A client that floods messages beyond a sequence gap is logged out and cut
+// off once it passes the hold limit, instead of growing memory without end;
+// everyone else carries on.
+static void test_flood_beyond_gap_is_cut_off() {
+    Gateway gw({"AAPL"}, config("", 100));
+    std::atomic<bool> stop{false};
+    std::thread server([&] { gw.run(stop); });
+    {
+        Client mallory(gw.port(), "MALLORY");
+        mallory.order("lost", '1', "1", "1.00");
+        mallory.s.output().clear();  // never sent: everything after it is beyond a gap
+        for (int i = 0; i < 101; ++i) mallory.order(("f" + std::to_string(i)).c_str(), '1', "1", "1.00");
+        mallory.wait([&] { return mallory.closed; });
+        assert(mallory.closed);
+        Client seller(gw.port(), "SELLER");
+        seller.order("s1", '2', "10", "10.00");
+        assert(seller.expect("s1")[fix::ExecType] == "0");
+    }
+    stop = true;
+    server.join();
+    assert(gw.orders() == 1);
+}
+
+// The deadlock: a gap fill releasing more orders than both 64k queues hold
+// used to leave the poll thread waiting for room toward the matcher while the
+// matcher waited for room back. The poll thread now empties the way back
+// while it waits.
+static void test_big_gap_fill_does_not_deadlock() {
+    constexpr int kHeld = 140'000;  // > 65,536 + 65,536
+    Gateway gw({"AAPL"}, config("", 200'000));
+    std::atomic<bool> stop{false};
+    std::thread server([&] { gw.run(stop); });
+    {
+        Client buyer(gw.port(), "BUYER");
+        buyer.order("gap", '1', "1", "1.00");
+        buyer.s.output().clear();  // lost: the next 140k are held until it is resent
+        for (int i = 0; i < kHeld; ++i) buyer.order(("h" + std::to_string(i)).c_str(), '1', "1", "1.00");
+        buyer.order("last", '1', "1", "1.00");
+        Nanos t0 = Gateway::now();
+        bool ok = buyer.wait([&] {
+            for (const Fields& f : buyer.got)
+                if (f.at(fix::ClOrdID) == "last") return true;
+            buyer.got.clear();
+            return false;
+        }, 120);
+        assert(ok);
+        std::printf("released %d held orders in %.2f s\n", kHeld + 1, double(Gateway::now() - t0) / 1e9);
+    }
+    stop = true;
+    server.join();
+    assert(gw.orders() == size_t(kHeld) + 2);
+}
+
 int main() {
     test_logon_needs_credentials_and_no_takeover();
+    test_flood_beyond_gap_is_cut_off();
+    test_big_gap_fill_does_not_deadlock();
     test_crash_and_recover_from_journal();
     test_oms_reconciles_after_reset();
     test_orders_over_tcp();
