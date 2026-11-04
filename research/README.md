@@ -7,7 +7,7 @@ Needs pandas and matplotlib.
 ## Queue position and latency (S6)
 
 ```
-./build/fill_study 01302019.NASDAQ_ITCH50 fills.csv AAPL MSFT SPY QQQ TSLA
+./build/fill_study day.itch fills.csv AAPL MSFT SPY QQQ TSLA
 python3 research/fill_study.py fills.csv
 ```
 
@@ -91,6 +91,18 @@ P(fill within 100 ms / 1 s / 10 s) for each symbol, queue bucket and latency,
 from timer joins. Each row covers `queue_lo <= shares ahead < queue_hi`; an
 empty `queue_hi` means the bucket has no upper bound.
 
+The table is a model, and S7 and S8 are scored with it, so it is fitted only
+on a **training window**: decisions from 09:30:00 to 09:32:50. Its 10 s
+horizon then ends before the **test window** opens at 09:33:00, and S7 and S8
+are scored only on parents that start in the test window. The figures above
+still describe the whole morning, because they are measurements, not inputs
+to anything scored later.
+
+```
+./build/fill_study --until 09:32:50 day.itch fills_train.csv AAPL MSFT SPY QQQ TSLA
+python3 research/fill_study.py fills.csv fills_train.csv     # figures from all, table from training only
+```
+
 ### Limits
 
 - **Size:** virtual orders are treated as size-negligible. The first trade
@@ -104,7 +116,7 @@ empty `queue_hi` means the bucket has no upper bound.
 ## Execution algos and TCA (S7)
 
 ```
-./build/algo_compare 01302019.NASDAQ_ITCH50 research/fill_prob.csv algos.csv AAPL MSFT SPY QQQ TSLA
+./build/algo_compare --from 09:33:00 day.itch research/fill_prob.csv algos.csv AAPL MSFT SPY QQQ TSLA
 python3 research/algo_compare.py algos.csv
 ```
 
@@ -120,18 +132,17 @@ child orders rest in the replayed books next to the real orders:
 
 ### The parent orders
 
-- One parent per symbol starts every 10 s from 09:30:30 to 09:36:00, 34
-  starts in all.
+- **Test window only.** One parent per symbol starts every 10 s from
+  09:33:00 to 09:36:00, 19 starts in all, after the window the fill table was
+  fitted on.
 - Each parent lasts 1 minute. Buys and sells alternate.
-- Each is sized at 5% of the volume in the minute before it. The median is
-  2,100 shares.
-- VWAP's volume curve comes from that same previous minute, so nothing looks
-  ahead.
-- In total there are 170 parents per algo.
+- Each is sized at 5% of the volume in the minute before it (past data, so
+  that is not look-ahead). The median is 1,800 shares.
+- VWAP's volume curve comes from that same previous minute.
+- In total there are 95 parents per algo.
 
 Parents that overlap in time would trade against each other's liquidity, so
-each replay runs only every sixth start. That takes 36 replays of the 751 MB
-file, in 14.7 s.
+each replay runs only every sixth start: 36 replays of the 751 MB file.
 
 ### How each algo works
 
@@ -146,74 +157,88 @@ file, in 14.7 s.
   - Adaptive follows the TWAP schedule. It crosses the whole slice when a
     hand-set score is positive. The score combines how far behind it is,
     book imbalance, S6 fill probability, spread and recent volatility.
+- **The Adaptive weights were never tuned on results.** They were written in
+  the commit that added the algos (`0be052f`), before `algo_compare` existed,
+  and haven't changed since.
 
-### Results
+### Results (test window)
 
 Mean cost per algo, in bps of the arrival mid. Positive is a cost. Every
 parent completed, so opportunity cost is 0.
 
 | algo | shortfall | spread | timing | vs VWAP | passive fills | children | duration |
 |---|---|---|---|---|---|---|---|
-| TWAP | 1.12 | 0.83 | 0.29 | 1.42 | 62% | 121 | 60 s |
-| VWAP | 1.29 | 1.01 | 0.28 | 1.56 | 59% | 109 | 60 s |
-| POV | 1.57 | 1.29 | 0.28 | 1.77 | 48% | 50 | 36 s |
-| Iceberg | -0.45 | -1.01 | 0.56 | -0.75 | 99% | 31 | 29 s |
-| IS | 1.12 | 0.85 | 0.27 | 1.39 | 62% | 127 | 60 s |
-| Adaptive | 0.84 | 0.56 | 0.28 | 1.10 | 39% | 77 | 60 s |
+| TWAP | 1.43 | 0.57 | 0.86 | 1.11 | 63% | 118 | 60 s |
+| VWAP | 1.53 | 0.66 | 0.87 | 1.23 | 61% | 109 | 60 s |
+| POV | 1.94 | 0.95 | 0.99 | 1.28 | 46% | 47 | 34 s |
+| Iceberg | 0.79 | -0.93 | 1.72 | -0.61 | 100% | 30 | 26 s |
+| IS | 1.66 | 0.61 | 1.05 | 1.33 | 62% | 125 | 60 s |
+| Adaptive | 1.14 | 0.39 | 0.75 | 0.82 | 40% | 77 | 60 s |
 
-The market's own drift over a minute is about 9 bps (the standard deviation
-of shortfall). That is far bigger than any gap between algos. So the useful
-comparison is paired: each algo minus TWAP on the same parent.
+The market's own drift over a minute is far bigger than any gap between algos.
+So the useful comparison is paired: each algo minus TWAP on the same parent.
 
-| algo | shortfall vs TWAP, bps |
-|---|---|
-| Iceberg | -1.57 ± 0.44 |
-| Adaptive | -0.28 ± 0.10 |
-| IS | 0.00 ± 0.15 |
-| VWAP | +0.17 ± 0.14 |
-| POV | +0.45 ± 0.29 |
+**How uncertain the paired gaps are.** The 95 parents are not 95 independent
+samples. The five symbols at one start share the market, and neighbouring
+starts overlap by 50 of their 60 seconds. `paired_stats.py` computes three
+standard errors:
+
+- iid, as if every parent were independent;
+- clustered by start time;
+- a moving-block bootstrap over runs of 6 starts.
+
+The table uses the largest of the three, and the 95% interval is ±1.96 of
+it. With 19 starts, that is still only a rough interval.
+
+| algo | shortfall vs TWAP, bps | 95% interval | SE: iid / clustered / block |
+|---|---|---|---|
+| Adaptive | **-0.29** | -0.53 to -0.05 | 0.12 / 0.09 / 0.05 |
+| VWAP | +0.11 | -0.19 to +0.40 | 0.15 / 0.15 / 0.10 |
+| IS | +0.23 | -0.31 to +0.77 | 0.18 / 0.28 / 0.12 |
+| POV | +0.52 | -0.32 to +1.35 | 0.30 / 0.43 / 0.16 |
+| Iceberg | -0.64 | -1.91 to +0.63 | 0.47 / 0.65 / 0.39 |
 
 ![algos](figures/algos.png)
 
 ### What the results show
 
-- **Adaptive beats TWAP by 0.28 bps (about 3 standard errors).** All of the
-  gain is in spread cost. The timing difference with TWAP is -0.01 ± 0.08 bps.
-  TWAP crosses whenever it falls behind, whatever the book looks like.
-  Adaptive crosses more often (only 39% of its fills are passive), but it
-  chooses when: tight spreads, and imbalance leaning against it. So each
-  cross is cheaper.
-- **Iceberg is cheapest in this model.** Almost every fill is passive, and
-  it earns about 1 bp of spread. Treat this as an upper bound. Iceberg
-  depends most on the fill model, which is generous to resting orders, as
-  explained under Limits.
-- **IS and VWAP match TWAP.** Over one minute, IS with kT = 2 front-loads
-  only slightly. One minute of history is a noisy volume curve for VWAP.
-- **POV is the most expensive.** At 10% participation it finishes early,
-  in 36 s, and crosses more.
-- **Prices revert after we stop.** The mid comes back about 1.2 bps within
-  10 s of the end for the schedule algos. That is temporary impact, mostly
-  from the final crossing.
+- **Adaptive beats TWAP out of sample: -0.29 bps, interval -0.53 to -0.05.**
+  - On the earlier in-sample run (the whole morning, with a fill table fitted
+    on that same morning) it was -0.28.
+  - The fill table barely moves it. Scoring the same test window with the old
+    whole-morning table gives the same -0.29. So the leakage didn't create
+    this result.
+  - Of the gap, -0.18 is spread and -0.11 timing. Adaptive crosses more often
+    than TWAP (only 40% of its fills are passive), but it chooses when:
+    tight spreads, and imbalance leaning against it. So each cross is
+    cheaper.
+- **Iceberg's in-sample "win" doesn't hold up.** It was -1.57 bps on the
+  whole morning. In the test window it is -0.64, with an interval that
+  includes zero. It also depends most on the fill model, which is generous
+  to resting orders, as explained under Limits.
+- **IS, VWAP and POV are not distinguishable from TWAP.** Over one minute, IS
+  with kT = 2 front-loads only slightly. One minute of history is a noisy
+  volume curve for VWAP. POV at 10% finishes early, in 34 s, and crosses
+  more.
 
 ### Limits
 
 - **Fill model:** passive fills follow the real queue, but the real market
   never reacts to our orders. When we fill ahead of a feed order, the feed
   order still trades in full. In effect the aggressor was that much bigger.
-  This flatters resting orders, which matters most for Iceberg. 5% of the
-  flow is small, but not zero.
+  This flatters resting orders, which matters most for Iceberg.
 - **Book drift:** our IOCs remove real orders. The feed later cancels or
   executes orders that are already gone, and the replay drops those
-  messages: 340 to 510 per replay, against 725k messages for these symbols.
-- **Adaptive weights:** they are hand-set, not fitted. Fitting them on one
-  morning and testing on the same morning would overfit. That needs more
-  days of data.
-- **Coverage:** one morning, five symbols, and 1-minute parents.
+  messages, a few hundred per replay.
+- **One morning:** the training and test windows are 3 minutes each, back
+  to back, on one morning. That separates the fit from the score. It is not
+  the same as testing on another day, which is the next step: the tools
+  already take any ITCH file.
 
 ## Smart order routing (S8)
 
 ```
-./build/sor_compare 01302019.NASDAQ_ITCH50 research/fill_prob.csv sor.csv AAPL MSFT SPY QQQ TSLA
+./build/sor_compare --from 09:33:00 day.itch research/fill_prob.csv sor.csv AAPL MSFT SPY QQQ TSLA
 python3 research/sor_compare.py sor.csv
 ```
 
@@ -233,9 +258,10 @@ books add up, level by level, to the single-venue replay.
 
 ### The parent orders and modes
 
-For each symbol, a parent starts every 5 s from 09:30:30 to 09:37:00, and
-buys and sells alternate. Each is sized at 1% of the previous minute's volume
-(median 400 shares). That gives 395 parents. Each parent runs in four modes:
+For each symbol, a parent starts every 5 s from 09:33:00 to 09:37:00 (the
+test window, after the fill table's training window), and buys and sells
+alternate. Each is sized at 1% of the previous minute's volume (median 300
+shares). That gives 245 parents. Each parent runs in four modes:
 
 - **Take:** route the whole order as IOCs, and route the remainder again once
   every child is back.
@@ -250,35 +276,39 @@ buys and sells alternate. Each is sized at 1% of the previous minute's volume
     rebate and spread earned, against the cost of crossing later.
   - The naive router always rests where the rebate is biggest (B).
 
-### Results
+### Results (test window)
 
-Paired results, smart minus naive, all-in cost in bps of the arrival mid:
+Paired results, smart minus naive, all-in cost in bps of the arrival mid.
+Errors are the largest of iid, clustered by start time, and a block bootstrap
+over 12 starts (one minute), as in S7.
 
-| | cost | of which fees | other |
-|---|---|---|---|
-| taking | **-0.039 ± 0.004** | -0.042 ± 0.004 | done in 1.03 rounds instead of 2.35 |
-| resting | +0.116 ± 0.038 | +0.018 ± 0.003 | 3.0 points fewer passive fills |
+| | cost | 95% interval | of which fees | other |
+|---|---|---|---|---|
+| taking | **-0.046** | -0.056 to -0.036 | -0.046 | done in 1.01 rounds instead of 2.24 |
+| resting | +0.136 | +0.009 to +0.263 | +0.029 | 4.5 points fewer passive fills |
 
 ![sor](figures/sor.png)
 
 - **Smart taking wins, by fees alone.** The naive router looks only at
   price. B is the deepest venue, so it most often shows the best price, and
   B costs 0.30¢ to take from. The smart router takes C first at the same
-  price, because C pays takers. It sends
-  38% of its shares to C, against 19% for naive. The prices paid are the
-  same, so the whole 0.04 bps gain is fees.
+  price, because C pays takers. It sends 39% of its shares to C, against 18%
+  for naive. The prices paid are the same, so the whole gain is fees. The
+  venues and fees are my own construction, so this shows the router does
+  what it is built to do, not a market finding.
 - **Smart taking finishes in one round.** It splits across venues at once.
-  Naive takes one venue's touch per round, so it needs about 2.4 rounds.
-  This barely matters here, because the replayed quotes rarely vanish
-  within a round trip. Even on C, 99% of IOC shares filled.
-- **Smart resting loses to rebate chasing.** It is 0.12 bps worse, and the
-  difference is real. The S6 fill table was measured on one consolidated
-  book, where every aggressor reaches the front of the queue. In this
-  replay, a real aggressor only trades on the venue that held its order in
-  the feed. So a thin venue (A) gets few fills even when its queue is short.
-  The table, read as queue / flow share, is far too optimistic there.
-  Correcting the table online from our own fills halved the gap in passive
-  fills, but it did not close it.
+  Naive takes one venue's touch per round, so it needs about 2.2 rounds. This
+  barely matters here, because the replayed quotes rarely vanish within a
+  round trip.
+- **Smart resting loses to rebate chasing.** It is 0.14 bps worse.
+  - The S6 fill table was measured on one consolidated book, where every
+    aggressor reaches the front of the queue. In this replay, a real
+    aggressor only trades on the venue that held its order in the feed. So a
+    thin venue (A) gets few fills even when its queue is short, and the
+    table, read as queue / flow share, is far too optimistic there.
+  - Fitting the table on the training window made smart resting look worse,
+    not better: +0.136, against +0.103 when the test window is scored with
+    the old whole-morning table. The leak had flattered it by about 0.03 bps.
 
 ### What this shows
 
@@ -296,5 +326,5 @@ Paired results, smart minus naive, all-in cost in bps of the arrival mid:
   schedule.
 - **Market data delay:** the router reads all three books instantly. Only
   orders pay latency. Quote fading and latency arbitrage are not modeled.
-- **Coverage:** one morning and five symbols. There are 395 parents per
-  mode, each run as 1 replay per mode over 3 venues.
+- **Coverage:** one morning and five symbols. There are 245 parents per
+  mode in the test window, each run as 1 replay per mode over 3 venues.
