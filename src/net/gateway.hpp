@@ -42,19 +42,34 @@
 // application messages through the same code, straight into the matching
 // engine, which rebuilds the books and the order table exactly.
 //
+// Clients authenticate on Logon (Username/Password against GatewayConfig::users).
+// Sessions are never shared: one connection per CompID at a time.
+//
 // Both threads busy-poll: lowest latency, one core each.
 // ponytail: no cancel-on-disconnect: a client's resting orders outlive its
 // connection; add it when a client asks for it.
+struct GatewayConfig {
+    uint16_t port = 0;  // 0: any free port
+    std::string comp_id = "EXCH";
+    // CompID -> password. A Logon must carry Username (553) = its SenderCompID
+    // and the matching Password (554), or the connection is closed before any
+    // session attaches. No entry, no access.
+    std::unordered_map<std::string, std::string> users;
+    std::string journal;   // empty = none; if it has records, the gateway recovers from them first
+    bool fsync = false;    // force the journal to disk before replying, not just to the OS
+    size_t max_held = 10'000;  // per session: messages held beyond a sequence gap
+};
+
 class Gateway {
 public:
-    // journal: empty = none. If the file has records, the gateway recovers from them first.
-    Gateway(std::vector<std::string> symbols, uint16_t port = 0, std::string comp_id = "EXCH",
-            std::string journal = "", bool fsync_each_pass = false)
-        : symbols_(std::move(symbols)), comp_(std::move(comp_id)), fsync_(fsync_each_pass) {
+    Gateway(std::vector<std::string> symbols, GatewayConfig cfg)
+        : symbols_(std::move(symbols)), comp_(cfg.comp_id), fsync_(cfg.fsync), users_(std::move(cfg.users)),
+          max_held_(cfg.max_held) {
+        uint16_t port = cfg.port;
         for (size_t i = 0; i < symbols_.size(); ++i) venue_.add_symbol();
-        if (!journal.empty()) {
-            recover(journal);
-            journal_ = std::make_unique<Journal>(journal);
+        if (!cfg.journal.empty()) {
+            recover(cfg.journal);
+            journal_ = std::make_unique<Journal>(cfg.journal);
         }
         listen_ = socket(AF_INET, SOCK_STREAM, 0);
         int one = 1;
@@ -134,6 +149,7 @@ public:
     // Received a new order -> its first execution report written to the socket.
     const Histogram& in_to_out() const { return in_to_out_; }
     uint64_t orders() const { return orders_.size(); }
+    uint64_t auth_failures() const { return auth_failures_; }
     // FNV-1a over every execution report the matching engine produced, in
     // order: a recovered gateway must arrive at the same value.
     uint64_t checksum() const { return checksum_; }
@@ -208,11 +224,13 @@ private:
 
     uint32_t add_client(const std::string& comp) {
         uint32_t i = uint32_t(clients_.size());
-        clients_.push_back(std::make_unique<Client>(Client{comp, Session({comp_, comp, 30'000'000'000, false}), {}, -1}));
+        clients_.push_back(std::make_unique<Client>(
+            Client{comp, Session({comp_, comp, 30'000'000'000, false, "", max_held_}), {}, -1}));
         clients_.back()->s.on_record = [this, i](bool out, std::string_view raw) {
             if (!journal_) return;
             std::string p(reinterpret_cast<const char*>(&i), sizeof i);
             p += raw;
+            redact_password(p);  // a journal is not a credential store
             journal_->append(out ? kOut : kIn, now(), std::string_view(p));
         };
         return i;
@@ -229,7 +247,9 @@ private:
                 return;
             }
             uint32_t ci;
+            if (p.size() < sizeof ci) return;
             std::memcpy(&ci, p.data(), sizeof ci);
+            if (ci >= clients_.size()) return;  // not ours: CRCs catch accidents, not tampering
             std::string_view raw = p.substr(sizeof ci);
             clients_[ci]->s.restore(type == kOut, raw);
             if (!m.parse(raw)) return;
@@ -256,12 +276,17 @@ private:
         Conn& c = *conns_[ci];
         if (c.client < 0) {
             c.pre.append(p, n);
+            if (c.pre.size() > kMaxPreLogon) return drop(ci);  // a Logon is a few hundred bytes
             fix::Frame f = fix::frame(c.pre);
             if (f.status == fix::Frame::More) return;
             fix::Message m;
             if (f.status != fix::Frame::Ok || !m.parse(std::string_view(c.pre).substr(0, f.len)) || m.type() != "A")
                 return drop(ci);
             std::string comp(m.get(fix::SenderCompID).value_or(""));
+            if (!authenticated(m, comp)) {
+                ++auth_failures_;
+                return drop(ci);  // no session, no journal record, no reply: nothing to learn
+            }
             int found = -1;
             for (size_t i = 0; i < clients_.size(); ++i)
                 if (clients_[i]->comp == comp) found = int(i);
@@ -346,6 +371,25 @@ private:
         }
         while (!to_venue_.try_push({rq})) cpu_relax();
         ++inflight_;
+    }
+
+    // Username must be the SenderCompID; the password is compared in constant
+    // time, so response timing doesn't reveal how much of a guess was right.
+    bool authenticated(const fix::Message& m, const std::string& comp) const {
+        auto it = users_.find(comp);
+        std::string_view user = m.get(fix::Username).value_or(""), pw = m.get(fix::Password).value_or("");
+        if (it == users_.end() || user != comp) return false;
+        const std::string& want = it->second;
+        unsigned diff = unsigned(want.size() ^ pw.size());
+        for (size_t i = 0; i < want.size(); ++i) diff |= unsigned(uint8_t(want[i]) ^ uint8_t(i < pw.size() ? pw[i] : 0));
+        return diff == 0;
+    }
+
+    static void redact_password(std::string& raw) {
+        size_t at = raw.find("\x01" "554=");
+        if (at == std::string::npos) return;
+        size_t from = at + 5, to = raw.find(fix::SOH, from);
+        raw.replace(from, to - from, "***");
     }
 
     std::optional<SymbolId> symbol(std::string_view name) const {
@@ -522,9 +566,14 @@ private:
         o.received = 0;
     }
 
+    static constexpr size_t kMaxPreLogon = 4096;
+
     std::vector<std::string> symbols_;
     std::string comp_;
     bool fsync_;
+    std::unordered_map<std::string, std::string> users_;
+    size_t max_held_;
+    uint64_t auth_failures_ = 0;
     int listen_ = -1;
     uint16_t port_ = 0;
     Venue venue_;                                   // the matcher's once run() starts

@@ -4,19 +4,33 @@
 #include <map>
 #include <string>
 #include <thread>
+#include <tuple>
 
 #include "net/gateway.hpp"
 #include "oms/oms.hpp"
 
 using Fields = std::map<uint32_t, std::string>;
 
+// Every test client logs on as NAME with password "pw-NAME".
+static GatewayConfig config(std::string journal = "", size_t max_held = 10'000) {
+    GatewayConfig c;
+    for (const char* who : {"BUYER", "SELLER", "MALLORY"}) c.users[who] = std::string("pw-") + who;
+    c.journal = std::move(journal);
+    c.max_held = max_held;
+    return c;
+}
+
 // A blocking test client: real socket, real Session.
 struct Client {
     int fd = -1;
+    bool closed = false;  // the gateway hung up
     Session s;
     std::vector<Fields> got;  // application messages received, in order
 
-    Client(uint16_t port, const char* name) : s({name, "EXCH", 30'000'000'000, true}) { connect_to(port, false); }
+    Client(uint16_t port, const char* name, std::string password = "")
+        : s({name, "EXCH", 30'000'000'000, true, password.empty() ? "pw-" + std::string(name) : password}) {
+        connect_to(port, false);
+    }
     ~Client() { drop(); }
     void drop() {  // the connection dies; the session stays
         if (fd >= 0) close(fd);
@@ -36,7 +50,11 @@ struct Client {
         timeval tv{0, 20'000};
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
         s.logon(Gateway::now(), reset);
-        assert(wait([&] { return s.state() == Session::State::Active; }));
+        assert(try_logon(reset));
+    }
+    // Logon already sent by connect: true once active, false if the gateway hangs up.
+    bool try_logon(bool) {
+        return wait([&] { return s.state() == Session::State::Active || closed; }) && s.state() == Session::State::Active;
     }
     void reconnect(uint16_t port, bool reset) {
         drop();
@@ -62,17 +80,20 @@ struct Client {
 
     // Sends what the session has queued, then reads until done() or 2 s pass.
     template <class P>
-    bool wait(P done) {
-        for (int i = 0; i < 100; ++i) {
+    bool wait(P done, double seconds = 2) {
+        Nanos deadline = Gateway::now() + Nanos(seconds * 1e9);
+        while (Gateway::now() < deadline) {
             std::string& out = s.output();
             while (!out.empty()) {
                 ssize_t n = write(fd, out.data(), out.size());
-                assert(n > 0);
+                if (n <= 0) return false;  // the gateway closed the connection
                 out.erase(0, size_t(n));
             }
             if (done()) return true;
-            char buf[4096];
+            char buf[1 << 16];
             ssize_t n = read(fd, buf, sizeof buf);
+            if (n == 0) closed = true;
+            if (n == 0) return done();
             if (n > 0)
                 s.on_bytes(buf, size_t(n), Gateway::now(), [&](const fix::Message& m) {
                     Fields f;
@@ -111,7 +132,7 @@ struct Client {
 };
 
 static void test_orders_over_tcp() {
-    Gateway gw({"AAPL", "MSFT"});
+    Gateway gw({"AAPL", "MSFT"}, config());
     std::atomic<bool> stop{false};
     std::thread server([&] { gw.run(stop); });
     {
@@ -178,7 +199,7 @@ static void test_crash_and_recover_from_journal() {
     uint64_t sum, digest, last_exec;
     std::unique_ptr<Client> buyer;
     {
-        Gateway gw({"AAPL"}, 0, "EXCH", path);
+        Gateway gw({"AAPL"}, config(path));
         std::atomic<bool> stop{false};
         std::thread server([&] { gw.run(stop); });
         buyer = std::make_unique<Client>(gw.port(), "BUYER");
@@ -200,7 +221,7 @@ static void test_crash_and_recover_from_journal() {
     std::fwrite("\x40\x00\x00\x00\x02", 1, 5, f);  // a record cut short mid-write
     std::fclose(f);
 
-    Gateway gw({"AAPL"}, 0, "EXCH", path);
+    Gateway gw({"AAPL"}, config(path));
     assert(gw.checksum() == sum && gw.book_digest() == digest && gw.orders() == 3);
     std::atomic<bool> stop{false};
     std::thread server([&] { gw.run(stop); });
@@ -227,7 +248,7 @@ static void test_crash_and_recover_from_journal() {
 // while it is away. It comes back with a sequence reset, so those execution
 // reports are gone for good, and rebuilds the truth from a mass status request.
 static void test_oms_reconciles_after_reset() {
-    Gateway gw({"AAPL"});
+    Gateway gw({"AAPL"}, config());
     std::atomic<bool> stop{false};
     std::thread server([&] { gw.run(stop); });
     Risk risk(1, RiskLimits{});
@@ -267,7 +288,57 @@ static void test_oms_reconciles_after_reset() {
     server.join();
 }
 
+// A logon attempt on a fresh socket; true if the gateway lets it in.
+static bool logs_on(uint16_t port, const char* comp, const char* password) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = htons(port);
+    assert(connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof a) == 0);
+    timeval tv{1, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    Session s({comp, "EXCH", 30'000'000'000, true, password});
+    s.logon(Gateway::now());
+    assert(write(fd, s.output().data(), s.output().size()) > 0);
+    char buf[4096];
+    ssize_t n = read(fd, buf, sizeof buf);
+    if (n > 0) s.on_bytes(buf, size_t(n), Gateway::now(), [](const fix::Message&) {});
+    close(fd);
+    return s.state() == Session::State::Active;
+}
+
+// No credentials, no session: a wrong or missing password, an unknown CompID,
+// or another client's valid password are all refused before any session
+// attaches. That also stops a takeover: a disconnected client's session (and
+// its resting orders) can only be resumed by that client.
+static void test_logon_needs_credentials_and_no_takeover() {
+    Gateway gw({"AAPL"}, config());
+    std::atomic<bool> stop{false};
+    std::thread server([&] { gw.run(stop); });
+    {
+        Client buyer(gw.port(), "BUYER");
+        buyer.order("b1", '1', "100", "10.00");
+        assert(buyer.expect("b1")[fix::ExecType] == "0");
+        assert(!logs_on(gw.port(), "BUYER", "pw-BUYER"));  // right password, but BUYER is already connected
+        buyer.drop();
+
+        assert(!logs_on(gw.port(), "BUYER", "wrong"));
+        assert(!logs_on(gw.port(), "BUYER", ""));            // no Username/Password at all
+        assert(!logs_on(gw.port(), "BUYER", "pw-MALLORY"));  // someone else's valid password
+        assert(!logs_on(gw.port(), "NOBODY", "pw-NOBODY"));  // not a user
+
+        buyer.reconnect(gw.port(), false);  // the real BUYER resumes: order still there
+        buyer.cancel("b2", "b1");
+        assert(buyer.expect("b2")[fix::ExecType] == "4");
+    }
+    stop = true;
+    server.join();
+    assert(gw.auth_failures() == 4);
+}
+
 int main() {
+    test_logon_needs_credentials_and_no_takeover();
     test_crash_and_recover_from_journal();
     test_oms_reconciles_after_reset();
     test_orders_over_tcp();

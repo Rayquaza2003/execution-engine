@@ -1,7 +1,8 @@
 // FIX load generator: one session against fix_gateway, measuring wire to wire
 // latency: from write() of a request to read() of the first reply to it.
-// Usage: ./build/fix_client PORT SYMBOL COUNT [WINDOW]
+// Usage: FIX_PASSWORD=... ./build/fix_client PORT SYMBOL COUNT [WINDOW]
 //   WINDOW = requests in flight at once (default 1: pure round trips)
+//   logs on as LOADGEN with the password from FIX_PASSWORD (not argv: ps shows argv)
 // Mix: 70% new limit orders (100 shares, random side, within 5 cents of
 // $100.00, so many cross and fill), 30% cancels of a random live order.
 #include <arpa/inet.h>
@@ -43,7 +44,12 @@ int main(int argc, char** argv) {
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
 
-    Session s({"LOADGEN", "EXCH", 30'000'000'000, true});
+    const char* pw = std::getenv("FIX_PASSWORD");
+    if (!pw) {
+        std::fprintf(stderr, "set FIX_PASSWORD\n");
+        return 2;
+    }
+    Session s({"LOADGEN", "EXCH", 30'000'000'000, true, pw});
     std::vector<uint64_t> sent_at(count + 1, 0);  // by ClOrdID; 0 once answered
     std::unordered_set<uint64_t> live;             // resting orders we may cancel
     std::vector<uint64_t> live_list;
