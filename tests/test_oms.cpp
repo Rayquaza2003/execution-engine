@@ -1,5 +1,6 @@
 #undef NDEBUG  // keep asserts on in Release builds
 #include <cassert>
+#include <cmath>
 #include <cstdio>
 #include <optional>
 #include <variant>
@@ -338,7 +339,40 @@ static void test_latency_creates_the_race_deterministically() {
 static_assert(transition(OrdState::CancelPending, OrdEvent::Fill, true) == OrdState::Filled,
               "a fill in flight beats the cancel");
 
+// The venue's status reports win: a missed fill is booked at the price that
+// makes the average right, a missed cancel closes the order, and an order the
+// venue never saw is rejected. Risk follows.
+static void test_reconcile_with_venue_status() {
+    Risk risk(1, RiskLimits{});
+    risk.mark(0, 100);
+    Oms oms(1, 1000, &risk);
+    std::vector<VenueRequest> out;
+    for (ClOrdId cl = 1; cl <= 4; ++cl) oms.submit({cl, 0, Side::Buy, OrdType::Limit, Tif::Day, 100, 100}, out);
+    auto ack = [&](ClOrdId cl) { oms.on_report({oms.find(cl)->id, 0, ExecType::New, Reject::None, 0, 0, 100}); };
+    ack(1);
+    ack(2);
+    ack(4);
+    oms.on_report({oms.find(2)->id, 0, ExecType::Trade, Reject::None, 100, 40, 60});  // we saw 40 of order 2
+    assert(risk.position(0) == 40 && risk.open_orders() == 4);
+
+    using S = OrdState;
+    size_t changed = oms.reconcile({
+        {1, S::Filled, 100, 101.0, 0},            // filled while we weren't looking
+        {2, S::Filled, 100, 100.6, 0},            // 60 more, at (100.6 * 100 - 40 * 100) / 60 = 101
+        {4, S::Cancelled, 0, 0, 0},               // cancelled (say, end of a session)
+    });                                           // 3 never reached the venue
+    assert(changed == 4);
+    const OmsOrder &o1 = *oms.find(1), &o2 = *oms.find(2), &o3 = *oms.find(3), &o4 = *oms.find(4);
+    assert(o1.state == S::Filled && o1.cum == 100 && o1.avg_px() == 101.0 && o1.leaves == 0);
+    assert(o2.state == S::Filled && o2.cum == 100 && std::fabs(o2.avg_px() - 100.6) < 1e-9);
+    assert(o3.state == S::Rejected && o3.last_reject == Reject::UnknownOrder && o4.state == S::Cancelled);
+    assert(oms.fills().back().px == 101 && oms.fills().back().qty == 60);
+    assert(risk.position(0) == 200 && risk.open_orders() == 0 && risk.open_qty(0, Side::Buy) == 0);
+    assert(oms.reconcile({{1, S::Filled, 100, 101.0, 0}, {2, S::Filled, 100, 100.6, 0}, {4, S::Cancelled, 0, 0, 0}}) == 0);
+}
+
 int main() {
+    test_reconcile_with_venue_status();
     test_every_state_event_pair_matches_spec();
     test_terminal_states_accept_nothing_else();
     test_lifecycle_new_partial_full();

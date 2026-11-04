@@ -1,7 +1,9 @@
 #pragma once
+#include <cmath>
 #include <cstdint>
 #include <deque>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 #include "core/id_index.hpp"
@@ -262,6 +264,57 @@ public:
         size_t sent = 0;
         for (const OmsOrder& o : orders_) sent += cancel(o.cl, out);
         return sent;
+    }
+
+    // The venue's view of one order, from an order status report.
+    struct VenueStatus {
+        ClOrdId cl;
+        OrdState state;
+        Qty cum;
+        double avg_px;  // ticks
+        Qty leaves;
+    };
+
+    // After a reconnect that lost execution reports for good (say a sequence
+    // reset), the venue's word wins: ask it for every order's status and pass
+    // the answers here. For each order the venue knows, missing fills are
+    // booked (one fill, at the price that makes the average match), and state
+    // and open quantity are set to the venue's. An open order the venue
+    // doesn't know never reached it: Rejected. Bypasses the state machine on
+    // purpose. Returns how many orders changed.
+    // ponytail: an order the OMS had closed but the venue still shows open
+    // isn't re-counted as open by risk; venues don't reopen orders.
+    size_t reconcile(const std::vector<VenueStatus>& venue) {
+        std::unordered_map<ClOrdId, const VenueStatus*> by;
+        for (const VenueStatus& v : venue) by[v.cl] = &v;
+        size_t changed = 0;
+        for (OmsOrder& o : orders_) {
+            bool was_open = !is_terminal(o.state);
+            Qty before = o.leaves;
+            auto it = by.find(o.cl);
+            if (it == by.end()) {
+                if (!was_open) continue;
+                o.state = OrdState::Rejected;
+                o.leaves = 0;
+                o.last_reject = Reject::UnknownOrder;
+            } else {
+                const VenueStatus& v = *it->second;
+                if (v.cum <= o.cum && v.state == o.state && v.leaves == o.leaves) continue;
+                if (v.cum > o.cum) {
+                    Qty q = v.cum - o.cum;
+                    Price px = Price(std::llround((v.avg_px * double(v.cum) - o.notional) / double(q)));
+                    o.cum = v.cum;
+                    o.notional += double(px) * double(q);
+                    fills_.push_back({now_, o.cl, o.id, o.sym, o.side, px, q});
+                    if (risk_) risk_->on_fill(o.sym, o.side, px, q);
+                }
+                o.state = v.state;
+                o.leaves = v.leaves;
+            }
+            if (risk_) risk_->on_leaves(o.sym, o.side, before, o.leaves, was_open && is_terminal(o.state));
+            ++changed;
+        }
+        return changed;
     }
 
     const OmsOrder* find(ClOrdId cl) const {
