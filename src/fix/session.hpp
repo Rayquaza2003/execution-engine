@@ -44,6 +44,13 @@ public:
         std::string sender, target;  // acceptor: an empty target takes the peer's Logon SenderCompID
         Nanos heartbeat = 30'000'000'000;
         bool initiator = false;
+        std::string password;      // initiator: sent on Logon as Username (553) = sender, Password (554)
+        size_t max_held = 10'000;  // messages held beyond a gap before the peer is logged out
+
+        Config(std::string s, std::string t, Nanos hb = 30'000'000'000, bool init = false, std::string pw = "",
+               size_t held = 10'000)
+            : sender(std::move(s)), target(std::move(t)), heartbeat(hb), initiator(init), password(std::move(pw)),
+              max_held(held) {}
     };
 
     explicit Session(Config c) : cfg_(std::move(c)) {}
@@ -64,6 +71,8 @@ public:
         emit("A", now, [&](fix::Writer& w) {
             w.field(fix::EncryptMethod, 0).field(fix::HeartBtInt, hb);
             if (reset) w.field(fix::ResetSeqNumFlag, 'Y');
+            if (cfg_.initiator && !cfg_.password.empty())
+                w.field(fix::Username, cfg_.sender).field(fix::Password, cfg_.password);
         });
     }
 
@@ -195,10 +204,18 @@ private:
         last_out_ = now;
     }
 
+    // A protocol violation: say why, then the session is over (the caller
+    // drops the connection once the Logout is written) without waiting for
+    // the peer to agree.
+    void fatal(Nanos now, std::string_view why) {
+        logout(now, why);
+        state_ = State::LoggedOut;
+    }
+
     // Logon received (in sequence, or early: a Logon is never held back).
     void on_logon(const fix::Message& m, Nanos now, bool reset) {
         if (!cfg_.initiator) {
-            if (std::optional<int64_t> hb = m.get_int(fix::HeartBtInt); hb && *hb > 0)
+            if (std::optional<int64_t> hb = m.get_int(fix::HeartBtInt); hb && *hb > 0 && *hb <= 3600)
                 cfg_.heartbeat = Nanos(*hb) * 1'000'000'000;
             logon(now, reset);
         }
@@ -217,7 +234,7 @@ private:
         }
         last_in_ = now;
         test_sent_ = 0;
-        if (state_ == State::AwaitingLogon && type != "A") return logout(now, "first message must be Logon");
+        if (state_ == State::AwaitingLogon && type != "A") return fatal(now, "first message must be Logon");
 
         bool reset = type == "A" && m.get(fix::ResetSeqNumFlag) == "Y";
         if (reset) next_in_ = uint64_t(*seq);  // the peer starts again: so do we
@@ -229,11 +246,17 @@ private:
         }
         if (uint64_t(*seq) < next_in_) {
             if (m.get(fix::PossDupFlag) == "Y") return;  // already have it
-            return logout(now, "MsgSeqNum too low");
+            return fatal(now, "MsgSeqNum too low");
         }
         if (uint64_t(*seq) > next_in_) {
             ++gaps_;
             if (type == "5") return logout(now);
+            // Everything beyond a gap is held in memory until the gap fills: a
+            // peer far ahead (or flooding) is cut off instead of growing it forever.
+            if (held_.size() >= cfg_.max_held) {
+                held_.clear();
+                return fatal(now, "too many messages beyond a sequence gap");
+            }
             if (type == "2" || type == "A") {  // act now, hold only its number
                 if (type == "2") serve_resend(m, now);
                 else on_logon(m, now, false);  // log on first, then ask for what's missing

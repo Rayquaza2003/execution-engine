@@ -30,7 +30,7 @@ enum Tag : uint32_t {
     LastQty = 32, MsgSeqNum = 34, MsgType = 35, NewSeqNo = 36, OrderID = 37, OrderQty = 38, OrdStatus = 39,
     OrdType = 40, OrigClOrdID = 41, PossDupFlag = 43, Price = 44, SenderCompID = 49, SendingTime = 52,
     Side = 54, Symbol = 55, TargetCompID = 56, Text = 58, TimeInForce = 59, CxlRejReason = 102,
-    EncryptMethod = 98, HeartBtInt = 108, ResetSeqNumFlag = 141, TestReqID = 112, OrigSendingTime = 122, GapFillFlag = 123,
+    EncryptMethod = 98, HeartBtInt = 108, ResetSeqNumFlag = 141, Username = 553, Password = 554, TestReqID = 112, OrigSendingTime = 122, GapFillFlag = 123,
     ExecType = 150, LeavesQty = 151, CxlRejResponseTo = 434, MassStatusReqID = 584, MassStatusReqType = 585,
     TotNumReports = 911, LastRptRequested = 912,
 };
@@ -54,7 +54,7 @@ inline std::optional<::Price> to_price(std::string_view v) {
     if (neg) v.remove_prefix(1);
     size_t dot = v.find('.');
     std::string_view whole = v.substr(0, dot), frac = dot == v.npos ? "" : v.substr(dot + 1);
-    if (whole.empty() || frac.size() > 2) return std::nullopt;
+    if (whole.empty() || whole.size() > 15 || frac.size() > 2) return std::nullopt;  // * 100 stays in int64
     std::optional<int64_t> w = to_int(whole);
     if (!w || *w < 0) return std::nullopt;
     int64_t f = 0;

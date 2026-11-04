@@ -194,6 +194,23 @@ static void test_reset_seq_num_logon() {
     assert((p.at_server == std::vector<std::string>{"a", "b"}) && p.server.resent() == 0 && p.client.gaps() == 0);
 }
 
+// Past the hold limit beyond a gap, the peer is logged out and the session is
+// over at once (the connection can be dropped without waiting for a reply).
+static void test_hold_limit_is_fatal() {
+    Session client({"CLIENT", "EXCH", 30 * kSec, true});
+    Session server({"EXCH", "CLIENT", 30 * kSec, false, "", 3});
+    client.logon(T0);
+    server.on_bytes(client.output().data(), client.output().size(), T0, [](const fix::Message&) {});
+    client.output().clear();
+    client.send("D", T0, [](fix::Writer& w) { w.field(fix::ClOrdID, "lost"); });
+    client.output().clear();
+    for (int i = 0; i < 4; ++i) client.send("D", T0, [](fix::Writer& w) { w.field(fix::ClOrdID, "x"); });
+    server.output().clear();
+    server.on_bytes(client.output().data(), client.output().size(), T0, [](const fix::Message&) { assert(false); });
+    assert(server.state() == Session::State::LoggedOut);
+    assert(server.output().find("58=too many messages beyond a sequence gap") != std::string::npos);
+}
+
 static void test_logout_handshake_and_utc() {
     Pair p;
     p.up();
@@ -214,5 +231,6 @@ int main() {
     test_acceptor_learns_peer_from_logon();
     test_restart_from_records();
     test_reset_seq_num_logon();
+    test_hold_limit_is_fatal();
     std::puts("all tests passed");
 }
