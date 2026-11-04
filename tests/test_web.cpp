@@ -54,6 +54,15 @@ static void test_trading_through_the_bench() {
     s = sb.state(0, t);
     assert(has(s, "\"cl\":4,") && has(s, "\"state\":\"filled\"") && has(s, "\"position\":-100"));
 
+    // Modify takes the new TOTAL: rest a buy above the bid, the other trader takes 40 of it.
+    assert(sb.order({{"sym", "AAPL"}, {"side", "buy"}, {"px", "151.50"}, {"qty", "100"}}, t).empty());  // cl 5, above every bid, incl. the other trader's 151.00
+    assert(sb.order({{"sym", "AAPL"}, {"side", "sell"}, {"px", "151.50"}, {"qty", "40"}, {"who", "other"}}, t).empty());
+    assert(has(sb.state(0, t), "\"cl\":5,\"sym\":\"AAPL\",\"side\":\"buy\",\"type\":\"limit\",\"tif\":\"day\",\"px\":151.50,\"qty\":100,\"cum\":40,\"leaves\":60"));
+    assert(sb.replace({{"cl", "5"}, {"px", "151.49"}, {"qty", "100"}}, t).empty());  // total stays 100, not 160
+    assert(has(sb.state(0, t), "\"px\":151.49,\"qty\":100,\"cum\":40,\"leaves\":60"));
+    assert(has(sb.replace({{"cl", "5"}, {"px", "151.49"}, {"qty", "40"}}, t), "more than the 40 already filled"));
+    assert(has(sb.replace({{"cl", "4"}, {"px", "151.00"}, {"qty", "200"}}, t), "already filled: nothing left to modify"));
+
     assert(sb.cancel({{"cl", "1"}}, t).empty() && !sb.cancel({{"cl", "1"}}, t).empty());
     assert(sb.kill(t).empty() && has(sb.state(0, t), "\"killed\":true"));
     assert(has(sb.order({{"sym", "AAPL"}, {"side", "buy"}, {"px", "149.00"}, {"qty", "1"}}, t), "kill switch"));

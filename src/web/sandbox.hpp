@@ -153,11 +153,18 @@ public:
         ClOrdId cl = ClOrdId(std::atoll(get(f, "cl").c_str()));
         const OmsOrder* o = oms_->find(cl);
         std::optional<Price> px = ticks(get(f, "px"));
-        long long qty = std::atoll(get(f, "qty").c_str());
-        if (!o || !px || *px <= 0 || qty <= 0) return "Enter a new price and quantity.";
+        long long total = std::atoll(get(f, "qty").c_str());  // the page asks for the new TOTAL quantity
+        if (!o) return "No such order.";
+        if (is_terminal(o->state))
+            return "Order #" + std::to_string(cl) + " is already " + state_name(o->state) + ": nothing left to modify.";
+        if (o->state == OrdState::PendingNew || o->state == OrdState::CancelPending || o->state == OrdState::ReplacePending)
+            return "Order #" + std::to_string(cl) + " is waiting on the venue (" + state_name(o->state) + "). Try again in a moment.";
+        if (!px || *px <= 0 || total <= 0) return "Enter a new price and quantity above zero.";
+        if (Qty(total) <= o->cum)
+            return "The new total must be more than the " + std::to_string(o->cum) + " already filled.";
         mark(o->sym);
         std::vector<VenueRequest> reqs;
-        if (!oms_->replace(cl, *px, Qty(qty), reqs))
+        if (!oms_->replace(cl, *px, Qty(total) - o->cum, reqs))  // the venue and OMS take the new OPEN quantity
             return o->last_reject != Reject::None ? std::string("Risk refused it: ") + reject_name(o->last_reject) + "."
                                                   : "That order can't be modified now.";
         for (const VenueRequest& rq : reqs) send(rq, now);
