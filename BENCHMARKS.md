@@ -1,5 +1,40 @@
 # Benchmarks
 
+## Hardware and method
+
+- **Machine.** Apple M1: 4 performance and 4 efficiency cores, 8 GB, macOS. Apple clang 21,
+  `-O3 -march=native`, Release builds. Debug (ASan/UBSan) and TSan builds are for correctness
+  only and are never timed.
+- **Clock.** `std::chrono::steady_clock` on Apple silicon ticks every 41.67 ns. Single
+  operations below that are reported from whole-run averages, not per-op timers.
+- **Repeats.** Unless a section says otherwise, numbers are medians of 5 runs, with the range
+  in brackets.
+- **Threads.** macOS can't pin a thread to a core. Threaded benchmarks ask for the
+  performance cores through the highest QoS class, and the scheduler places them, so their
+  tails include OS preemption. Linux numbers with pinned, isolated cores are still to do.
+- **Inputs.** Synthetic workloads use fixed seeds. Real-data numbers use NASDAQ's
+  TotalView-ITCH 5.0 sample for 2019-01-30, the first 751 MB (22.4M messages up to 09:38).
+  See the README for how to fetch it.
+- **Correctness alongside speed.** `bench_book` prints a checksum over every trade. It has been
+  `2a79b8de12e4cd7d` at every commit since the first baseline, so no optimization changed a
+  single fill.
+
+### Contents
+
+- [Phase 1 to 3: the order book, one change at a time](#phase-3-one-change-at-a-time)
+- [S2: exchange features on the hot path](#s2-exchange-features-on-the-hot-path)
+- [S4: pre-trade risk](#s4-pre-trade-risk-check)
+- [S5: ITCH market data](#s5-market-data-from-itch)
+- [S6: queue-position study](#s6-queue-position-study)
+- [S7: execution algos](#s7-execution-algos)
+- [S8: smart order routing](#s8-smart-order-routing)
+- [S9: threads, queues, logger](#s9-threads-queues-logger)
+- [S10: FIX gateway over TCP](#s10-fix-gateway-over-tcp)
+- [S11: journal, recovery, reconciliation](#s11-journal-recovery-reconciliation)
+- [S12: the order book again, at the final commit](#s12-the-order-book-again-at-the-final-commit)
+
+## Order book workload
+
 Run: `cmake --build build && ./build/bench_book` (10M ops, fixed seed 42, first 10k ops are untimed warmup).
 
 Workload after warmup: 45% limit, 45% cancel, 5% modify, 5% market. Prices 0-40 ticks
@@ -399,3 +434,18 @@ recovered checksums matched by luck. The ASan build didn't, and the test failed 
 hashes now go field by field.
 
 The order book checksum is still `2a79b8de12e4cd7d`.
+
+## S12: the order book again, at the final commit
+
+`bench_book` was run 5 times on the final code. S2 changed the matching hot path, at no
+measurable cost. The stages after it added code around the book (replay fills, accessors,
+venue logic) but left the hot path alone.
+
+| | median M ops/s | range | p50 | p99 | hot-path allocations | checksum |
+|---|---|---|---|---|---|---|
+| Phase 3, step 4 | 29.61 | 26.34 to 30.60 | 42 ns | 125 ns | 0 | `2a79b8de12e4cd7d` |
+| final commit | 37.98 | 28.76 to 43.77 | 41 ns | 125 ns | 0 | `2a79b8de12e4cd7d` |
+
+The higher median comes from the machine and its background load, not from code: the ranges
+overlap, and the matching code is the same. The claim that holds is "about 30 M ops/s or
+better, with zero allocations and identical output".
