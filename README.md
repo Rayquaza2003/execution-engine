@@ -132,7 +132,8 @@ cmake -B build-fuzz -DFUZZ=ON -DCMAKE_CXX_COMPILER=clang++   # libFuzzer targets
 ### Test bench in the browser
 
 ```sh
-./build/web_ui            # then open http://127.0.0.1:8080
+./build/web_ui                                          # then open http://127.0.0.1:8080
+./build/web_ui --itch day.itch AAPL MSFT SPY QQQ TSLA   # also offers NASDAQ replay
 ```
 
 This is a trading screen over the live engine: a venue with AAPL, MSFT and SPY books, your
@@ -147,6 +148,17 @@ orders through the OMS and risk checks, and a background flow of makers and take
   - Hit the kill switch.
   - Run a 200k-order burst to see throughput, with the engine's time per request (p50,
     p99, p99.9) live in the header.
+
+**NASDAQ replay.** Started with `--itch`, the page can switch from the simulated market to
+the real one:
+
+- The books for those symbols are rebuilt from the ITCH file. Pre-market is fast-forwarded
+  to 09:30 in about a second.
+- The file then plays at real time, 10×, 60×, 600× or as fast as possible, with pause and the
+  exchange clock shown.
+- Your orders go into the real books through the OMS and risk. They queue behind real
+  orders and fill when real executions reach them, the same queue model as the S6 and S7
+  studies. The replayed market doesn't react to you.
 
 The page is plain HTML and JavaScript (`web/index.html`). The server is one thread on POSIX
 sockets, listening on loopback only (`tools/web_ui.cpp`, `src/web/`).
