@@ -53,6 +53,7 @@ static std::string handle(Sandbox& sb, const web::Request& r) {
     else if (r.path == "/api/cancel") err = sb.cancel(f, now);
     else if (r.path == "/api/replace") err = sb.replace(f, now);
     else if (r.path == "/api/kill") err = sb.kill(now);
+    else if (r.path == "/api/resume") err = sb.resume();
     else if (r.path == "/api/reset") sb.reset();
     else if (r.path == "/api/flow") sb.set_flow(std::atof(f["rate"].c_str()));
     else if (r.path == "/api/burst") err = sb.burst(std::atoll(f["n"].c_str()), now);

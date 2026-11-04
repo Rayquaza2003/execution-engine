@@ -57,6 +57,9 @@ static void test_trading_through_the_bench() {
     assert(sb.cancel({{"cl", "1"}}, t).empty() && !sb.cancel({{"cl", "1"}}, t).empty());
     assert(sb.kill(t).empty() && has(sb.state(0, t), "\"killed\":true"));
     assert(has(sb.order({{"sym", "AAPL"}, {"side", "buy"}, {"px", "149.00"}, {"qty", "1"}}, t), "kill switch"));
+    assert(sb.resume().empty() && has(sb.state(0, t), "\"killed\":false"));
+    assert(sb.order({{"sym", "AAPL"}, {"side", "buy"}, {"px", "149.00"}, {"qty", "1"}}, t).empty());
+    assert(has(sb.state(0, t), "\"cl\":1,") && has(sb.state(0, t), "\"state\":\"cancelled\""));  // stays cancelled
     sb.reset();
     assert(has(sb.state(0, t), "\"killed\":false") && has(sb.state(0, t), "\"orders\":[]"));
 }

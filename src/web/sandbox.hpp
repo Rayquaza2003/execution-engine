@@ -118,6 +118,12 @@ public:
         return "";
     }
 
+    // Trading allowed again after a kill; what the kill cancelled stays cancelled.
+    std::string resume() {
+        risk_->resume();
+        return "";
+    }
+
     void set_flow(double per_second) { flow_rate_ = std::clamp(per_second, 0.0, 200'000.0); }
 
     // n background orders as fast as the engine takes them.

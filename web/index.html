@@ -186,7 +186,7 @@
 
     <h2 class="risk-head">Risk on this symbol</h2>
     <dl class="risk" id="risk"></dl>
-    <div class="killed" id="killed" hidden>Kill switch is on. Every new order is refused until you reset the session.</div>
+    <div class="killed" id="killed" hidden>Kill switch is on. Every new order is refused until you resume trading.</div>
   </section>
 
   <section id="ladder-box" aria-labelledby="ladder-h">
@@ -311,7 +311,18 @@ $("burst").addEventListener("click", async () => {
   $("burst").disabled = false;
 });
 $("reset").addEventListener("click", async () => { await post("/api/reset", {}); lastTape = null; say("New session: books, orders and risk start fresh.", false); });
-$("kill").addEventListener("click", async () => { await post("/api/kill", {}); say("Kill switch on: working orders cancelled.", false); });
+// One button, two deliberate steps: kill cancels everything and blocks new
+// orders; resume only unblocks new orders (nothing cancelled comes back).
+let killed = false;
+$("kill").addEventListener("click", async () => {
+  if (killed) {
+    const err = await post("/api/resume", {});
+    say(err || "Trading resumed. Orders the kill switch cancelled stay cancelled.", !!err);
+  } else {
+    await post("/api/kill", {});
+    say("Kill switch on: working orders cancelled, new orders refused.", false);
+  }
+});
 
 function render(s) {
   symbols = s.symbols;
@@ -372,8 +383,10 @@ function render(s) {
     <dt>Largest order</dt><dd>${int(r.max_order_qty)}</dd>
     <dt>Price band around mid</dt><dd>${r.collar_pct}%</dd>
     <dt>Stop trading at a loss of</dt><dd>$${int(r.max_loss)}</dd>`;
+  killed = r.killed;
   $("killed").hidden = !r.killed;
   $("kill").setAttribute("aria-pressed", r.killed);
+  $("kill").textContent = r.killed ? "Resume trading" : "Kill switch";
   if (document.activeElement !== $("flow")) { $("flow").value = s.stats.flow; $("flow-val").textContent = Math.round(s.stats.flow) + "/s"; }
 }
 
