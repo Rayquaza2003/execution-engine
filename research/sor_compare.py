@@ -19,6 +19,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from paired_stats import paired
 
 HERE = Path(__file__).resolve().parent
 d = pd.read_csv(sys.argv[1] if len(sys.argv) > 1 else "sor.csv")
@@ -37,6 +38,11 @@ print(summary.round(3).to_string())
 
 # %% [markdown]
 # ## Paired: smart minus naive
+#
+# Parents start every 5 s and are over within ~2 s, so windows don't overlap,
+# but the five symbols at one start share the market. Errors are clustered by
+# start time; the block bootstrap (runs of 12 starts = one minute) adds any
+# drift that carries across neighbouring starts.
 
 # %%
 key = ["sym", "start_ns"]
@@ -47,11 +53,14 @@ for kind in ["Take", "Post"]:
     r = {"kind": kind}
     for c in ["cost_bps", "fee_bps", "passive_share", "rounds"]:
         diff = (s[c] - n[c]).dropna()
-        r[c] = diff.mean()
-        r[c + "_se"] = diff.std(ddof=1) / np.sqrt(len(diff))
+        st = paired(diff, pd.Series(diff.index.get_level_values("start_ns")), block=12)
+        r[c] = st["mean"]
+        r[c + "_se"] = st["se"]
+        if c == "cost_bps":
+            r.update({k: st[k] for k in ["se", "se_iid", "se_clustered", "se_block", "ci_lo", "ci_hi", "n", "starts"]})
     rows.append(r)
-paired = pd.DataFrame(rows).set_index("kind")
-print(paired.round(3).to_string())
+paired_tab = pd.DataFrame(rows).set_index("kind")
+print(paired_tab.round(3).to_string())
 
 # %%
 INK, MUTED, GRID, SURFACE = "#1f1f1d", "#6b6a66", "#e6e5e1", "#fcfcfb"
@@ -80,14 +89,14 @@ a1.set_xlabel("share of filled shares")
 a1.set_title("Where each router traded", loc="left", color=INK)
 a1.legend(ncol=3, loc="upper center", bbox_to_anchor=(0.5, -0.2))
 
-y2 = np.arange(len(paired))[::-1]
-a2.errorbar(paired.cost_bps, y2, xerr=1.96 * paired.cost_bps_se, fmt="o", color=VENUE["A"],
+y2 = np.arange(len(paired_tab))[::-1]
+a2.errorbar(paired_tab.cost_bps, y2, xerr=[paired_tab.cost_bps - paired_tab.ci_lo, paired_tab.ci_hi - paired_tab.cost_bps], fmt="o", color=VENUE["A"],
             ecolor=VENUE["A"], elinewidth=2, capsize=0)
 a2.axvline(0, color=MUTED, linewidth=0.8)
 a2.set_yticks(y2, ["taking", "resting"])
 a2.set_ylim(-0.6, 1.6)
 a2.grid(axis="y", visible=False)
-a2.set_xlabel("smart minus naive all-in cost, bps (95% interval)")
+a2.set_xlabel("smart minus naive all-in cost, bps (95% interval, most conservative SE)")
 a2.set_title("Smart vs naive on the same parents", loc="left", color=INK)
 fig.tight_layout()
 fig.savefig(HERE / "figures/sor.png", dpi=150)

@@ -2,19 +2,35 @@
 // the best bid and offer every 100 ms, and every new best level as it opens,
 // at each latency in the sweep, and writes
 // one CSV row per virtual order (see analytics/fill_study.hpp).
-// Usage: ./build/fill_study FILE OUT.csv SYMBOL [SYMBOL...]
+// Usage: ./build/fill_study [--until HH:MM:SS] FILE OUT.csv SYMBOL [SYMBOL...]
+//   --until: no decisions from that time on (fit the fill table on a training window)
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <string>
 #include <vector>
 
 #include "analytics/fill_study.hpp"
 
+
+// "HH:MM:SS" -> ns since midnight (ITCH time).
+static Nanos clock_time(const char* s) {
+    int h = 0, m = 0, sec = 0;
+    std::sscanf(s, "%d:%d:%d", &h, &m, &sec);
+    return Nanos((h * 3600 + m * 60 + sec)) * 1'000'000'000;
+}
+
 int main(int argc, char** argv) {
+    FillConfig cfg;
+    if (argc > 2 && !std::strcmp(argv[1], "--until")) {
+        cfg.end = clock_time(argv[2]);
+        argv += 2;
+        argc -= 2;
+    }
     if (argc < 4) {
-        std::fprintf(stderr, "usage: %s FILE OUT.csv SYMBOL [SYMBOL...]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s [--until HH:MM:SS] FILE OUT.csv SYMBOL [SYMBOL...]\n", argv[0]);
         return 2;
     }
     FILE* in = std::fopen(argv[1], "rb");
@@ -28,7 +44,7 @@ int main(int argc, char** argv) {
     // ponytail: FillConfig defaults (100 ms decisions, 10 s horizon, 1 s markout); add flags when a study needs others
     Venue venue;
     ItchReplay replay(venue, want);
-    FillStudy study(replay, venue);
+    FillStudy study(replay, venue, cfg);
     VenueOut out;
     std::vector<FillRow> rows;
     std::map<Nanos, std::pair<size_t, size_t>> by_latency;  // filled, total

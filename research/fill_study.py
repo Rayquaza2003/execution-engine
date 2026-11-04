@@ -9,6 +9,11 @@
 #   joins of a freshly opened best level
 # - `fill_prob.csv`: the lookup table the S7 adaptive algo and the S8 router read
 #
+# The figures describe the whole window. The lookup table is a model that S7
+# and S8 are then scored with, so it must not see their test window: pass the
+# training-window CSV as a second argument and the table is fitted on that alone:
+# `python3 research/fill_study.py fills.csv fills_train.csv`.
+#
 # Cells use the `# %%` percent format, so this opens as a notebook in Jupyter
 # (via jupytext) or VS Code, and also runs as a plain script:
 # `python3 research/fill_study.py fills.csv`.
@@ -26,6 +31,7 @@ import pandas as pd
 
 HERE = Path(__file__).resolve().parent
 csv = sys.argv[1] if len(sys.argv) > 1 else "fills.csv"
+train_csv = sys.argv[2] if len(sys.argv) > 2 else csv
 d = pd.read_csv(csv)
 d["ms"] = d.latency_ns / 1e6
 print(f"{len(d)} orders, {d.sym.nunique()} symbols, {d.filled.mean():.1%} filled within the horizon")
@@ -35,9 +41,17 @@ print(f"{len(d)} orders, {d.sym.nunique()} symbols, {d.filled.mean():.1%} filled
 # positions. Bucket each symbol by its own quintiles of queue ahead instead,
 # with edges from its timer joins at zero latency.
 Q = 5
-base = d[(d.new_level == 0) & (d.latency_ns == 0)]
-EDGES = {s: np.unique(np.quantile(g.queue_ahead, np.linspace(0, 1, Q + 1))[1:-1]) for s, g in base.groupby("sym")}
-d["bucket"] = [int(np.searchsorted(EDGES[s], q, side="right")) for s, q in zip(d.sym, d.queue_ahead)]
+
+
+def bucketize(frame):
+    """Per-symbol quintile edges of queue ahead (timer joins, zero latency); adds frame.bucket."""
+    base = frame[(frame.new_level == 0) & (frame.latency_ns == 0)]
+    edges = {s: np.unique(np.quantile(g.queue_ahead, np.linspace(0, 1, Q + 1))[1:-1]) for s, g in base.groupby("sym")}
+    frame["bucket"] = [int(np.searchsorted(edges[s], q, side="right")) for s, q in zip(frame.sym, frame.queue_ahead)]
+    return edges
+
+
+EDGES = bucketize(d)
 HORIZONS_NS = [100_000_000, 1_000_000_000, 10_000_000_000]
 for h in HORIZONS_NS:
     d[f"fill_{h}"] = d.filled.astype(bool) & (d.time_to_fill_ns <= h)
@@ -131,16 +145,22 @@ for name, t in lat.items():
 # ## Export the lookup table
 #
 # P(fill within horizon) per symbol, queue bucket and latency, from timer
-# joins. A bucket covers queue_lo <= shares ahead < queue_hi (queue_hi empty =
-# open-ended).
+# joins in the training CSV. A bucket covers queue_lo <= shares ahead <
+# queue_hi (queue_hi empty = open-ended).
 
 # %%
+train = d if train_csv == csv else pd.read_csv(train_csv)
+TRAIN_EDGES = EDGES if train is d else bucketize(train)
+for h in HORIZONS_NS:
+    train[f"fill_{h}"] = train.filled.astype(bool) & (train.time_to_fill_ns <= h)
+print(f"\nlookup table from {train_csv}: {len(train)} orders, decided "
+      f"{train.decided_ns.min() / 1e9 / 3600:.4f} h to {train.decided_ns.max() / 1e9 / 3600:.4f} h after midnight")
 rows = []
 for h in HORIZONS_NS:
-    g = timer.groupby(["sym", "bucket", "latency_ns"])[f"fill_{h}"].agg(["size", "mean"])
+    g = train[train.new_level == 0].groupby(["sym", "bucket", "latency_ns"])[f"fill_{h}"].agg(["size", "mean"])
     for (sym, b, l), r in g.iterrows():
-        e = [0, *EDGES[sym]]
-        hi = int(EDGES[sym][b]) if b < len(EDGES[sym]) else ""
+        e = [0, *TRAIN_EDGES[sym]]
+        hi = int(TRAIN_EDGES[sym][b]) if b < len(TRAIN_EDGES[sym]) else ""
         rows.append((sym, int(e[b]), hi, l, h, int(r["size"]), round(r["mean"], 4)))
 out = pd.DataFrame(rows, columns=["sym", "queue_lo", "queue_hi", "latency_ns", "horizon_ns", "n", "p_fill"])
 out.sort_values(["sym", "horizon_ns", "latency_ns", "queue_lo"]).to_csv(HERE / "fill_prob.csv", index=False)

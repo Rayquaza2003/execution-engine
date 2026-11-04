@@ -35,6 +35,7 @@
 struct FillConfig {
     std::vector<Nanos> latencies{0, 10'000, 100'000, 1'000'000, 10'000'000, 100'000'000};
     Nanos start = 34'200'000'000'000;  // 09:30, first decision
+    Nanos end = ~Nanos(0);             // no decisions from here on (e.g. to keep a test window out)
     Nanos every = 100'000'000;         // decision interval
     Nanos horizon = 10'000'000'000;    // an unfilled order is cancelled after this
     Nanos markout = 1'000'000'000;     // mid measured this long after the fill
@@ -146,6 +147,7 @@ private:
     }
 
     void decide(SymbolId s) {
+        if (loop_.now() >= cfg_.end) return;  // and no more timer decisions for this symbol
         const OrderBook& b = venue_.book(s);
         if (std::optional<Price> bid = b.best_bid()) join(s, Side::Buy, *bid, false);
         if (std::optional<Price> ask = b.best_ask()) join(s, Side::Sell, *ask, false);
@@ -199,7 +201,8 @@ private:
         if (!r.qty) return;
         through(s, r.side == Side::Buy ? Side::Sell : Side::Buy, r.price, true);
         std::optional<Price> best = r.side == Side::Buy ? b.best_bid() : b.best_ask();
-        if (cfg_.join_new_levels && loop_.now() >= cfg_.start && best == r.price && b.depth(r.side, r.price) == r.qty)
+        if (cfg_.join_new_levels && loop_.now() >= cfg_.start && loop_.now() < cfg_.end && best == r.price &&
+            b.depth(r.side, r.price) == r.qty)
             join(s, r.side, r.price, true);
     }
 

@@ -1,6 +1,7 @@
 // Smart vs naive order routing over three venues carved out of one NASDAQ
 // ITCH 5.0 file (see sor/sor_sim.hpp). Writes one row per parent order.
-// Usage: ./build/sor_compare FILE FILL_PROB.csv OUT.csv SYMBOL [SYMBOL...]
+// Usage: ./build/sor_compare [--from HH:MM:SS] FILE FILL_PROB.csv OUT.csv SYMBOL [SYMBOL...]
+//   --from: first parent start (e.g. after the window the fill table was fitted on)
 //
 // Parents: for each symbol, one every 5 s from 09:30:30 to 09:37:00,
 // alternating buy and sell, sized at 1% of the symbol's volume in the minute
@@ -11,8 +12,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <map>
 #include <string>
@@ -21,9 +24,9 @@
 #include "sor/sor_sim.hpp"
 
 constexpr Nanos kSec = 1'000'000'000;
-constexpr Nanos kFirst = 34'230 * kSec;  // 09:30:30
+constexpr Nanos kOpen = 34'230 * kSec;  // 09:30:30
+constexpr Nanos kLast = 34'620 * kSec;  // 09:37:00
 constexpr Nanos kStride = 5 * kSec;
-constexpr int kStarts = 79;               // last at 09:37:00
 constexpr double kSize = 0.01;            // of the previous minute's volume
 constexpr Nanos kRest = 2 * kSec;         // post modes rest this long
 
@@ -34,9 +37,24 @@ const std::vector<VenueConfig> kVenues = {
     {"C", -0.10, 0.15, 1'000'000, 0.3},  // inverted: pays takers; 1 ms away
 };
 
+
+// "HH:MM:SS" -> ns since midnight (ITCH time).
+static Nanos clock_time(const char* s) {
+    int h = 0, m = 0, sec = 0;
+    std::sscanf(s, "%d:%d:%d", &h, &m, &sec);
+    return Nanos((h * 3600 + m * 60 + sec)) * 1'000'000'000;
+}
+
 int main(int argc, char** argv) {
+    Nanos kFirst = kOpen;  // --from: test window only, after the fill table's training window
+    if (argc > 2 && !std::strcmp(argv[1], "--from")) {
+        kFirst = std::max(kOpen, clock_time(argv[2]));
+        argv += 2;
+        argc -= 2;
+    }
+    const int kStarts = int((kLast - kFirst) / kStride) + 1;
     if (argc < 5) {
-        std::fprintf(stderr, "usage: %s FILE FILL_PROB.csv OUT.csv SYMBOL [SYMBOL...]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s [--from HH:MM:SS] FILE FILL_PROB.csv OUT.csv SYMBOL [SYMBOL...]\n", argv[0]);
         return 2;
     }
     int fd = open(argv[1], O_RDONLY);

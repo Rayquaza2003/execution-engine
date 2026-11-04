@@ -1,6 +1,7 @@
 // Runs every execution algo on the same parent orders over a NASDAQ ITCH 5.0
 // file and writes one TCA row per (algo, parent order) as CSV.
-// Usage: ./build/algo_compare FILE FILL_PROB.csv OUT.csv SYMBOL [SYMBOL...]
+// Usage: ./build/algo_compare [--from HH:MM:SS] FILE FILL_PROB.csv OUT.csv SYMBOL [SYMBOL...]
+//   --from: first parent start (e.g. after the window the fill table was fitted on)
 //
 // Parents: for each symbol, a 1-minute order starting every 10 s from 09:30:30,
 // alternating buy and sell. Each is sized at 5% of the symbol's volume in the
@@ -13,8 +14,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -24,18 +27,33 @@
 #include "algo/exec_sim.hpp"
 
 constexpr Nanos kSec = 1'000'000'000;
-constexpr Nanos kFirst = 34'230 * kSec;  // 09:30:30, after the opening cross
+constexpr Nanos kOpen = 34'230 * kSec;  // 09:30:30, after the opening cross
+constexpr Nanos kLast = 34'560 * kSec;  // 09:36:00: the last parent ends 09:37:00, inside the data
 constexpr Nanos kWindow = 60 * kSec;
 constexpr Nanos kStride = 10 * kSec;
-constexpr int kStarts = 34;                 // last one ends 09:37:00
 constexpr int kGroups = kWindow / kStride;  // replays per algo, so no two parents overlap
 constexpr size_t kBins = 12;            // VWAP curve resolution
 constexpr Nanos kLatency = 100'000;     // one way, 100 us
 constexpr double kSize = 0.05;          // of the previous window's volume
 
+
+// "HH:MM:SS" -> ns since midnight (ITCH time).
+static Nanos clock_time(const char* s) {
+    int h = 0, m = 0, sec = 0;
+    std::sscanf(s, "%d:%d:%d", &h, &m, &sec);
+    return Nanos((h * 3600 + m * 60 + sec)) * 1'000'000'000;
+}
+
 int main(int argc, char** argv) {
+    Nanos kFirst = kOpen;  // --from: test window only, after the fill table's training window
+    if (argc > 2 && !std::strcmp(argv[1], "--from")) {
+        kFirst = std::max(kOpen, clock_time(argv[2]));
+        argv += 2;
+        argc -= 2;
+    }
+    const int kStarts = int((kLast - kFirst) / kStride) + 1;
     if (argc < 5) {
-        std::fprintf(stderr, "usage: %s FILE FILL_PROB.csv OUT.csv SYMBOL [SYMBOL...]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s [--from HH:MM:SS] FILE FILL_PROB.csv OUT.csv SYMBOL [SYMBOL...]\n", argv[0]);
         return 2;
     }
     int fd = open(argv[1], O_RDONLY);
