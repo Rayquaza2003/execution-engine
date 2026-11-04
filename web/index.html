@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Engine test bench</title>
+<link rel="icon" href="data:,">
+<style>
+  :root {
+    --bg: #EEF2F3;
+    --panel: #F8FAFA;
+    --ink: #22303A;
+    --muted: #5F6F78;
+    --rule: #CBD5D8;
+    --bid: #0B7A6A;
+    --bid-tint: #D5EEE8;
+    --ask: #B23A55;
+    --ask-tint: #F5DCE3;
+    --action: #1F4FC4;
+    --warn: #955A00;
+    --warn-tint: #FBEBD0;
+    --sans: ui-sans-serif, -apple-system, "Segoe UI", system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 var(--sans); }
+  body { font-variant-numeric: tabular-nums; }
+  button, input, select { font: inherit; color: inherit; }
+  :focus-visible { outline: 2px solid var(--action); outline-offset: 2px; }
+  h1 { font-size: 17px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
+  h2 { font-size: 13px; font-weight: 650; margin: 0 0 8px; color: var(--muted); }
+
+  header {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px;
+    padding: 12px 16px; border-bottom: 1px solid var(--rule); background: var(--panel);
+  }
+  .tabs { display: flex; gap: 4px; }
+  .tabs button {
+    border: 1px solid var(--rule); background: transparent; border-radius: 6px; padding: 4px 12px; cursor: pointer;
+  }
+  .tabs button[aria-pressed="true"] { background: var(--ink); color: var(--panel); border-color: var(--ink); }
+  .readout { display: flex; gap: 16px; color: var(--muted); font-size: 13px; }
+  .readout b { color: var(--ink); font-weight: 600; }
+  .controls { display: flex; align-items: center; gap: 10px; margin-left: auto; flex-wrap: wrap; }
+  .controls label { color: var(--muted); font-size: 13px; display: flex; align-items: center; gap: 6px; }
+  .btn {
+    border: 1px solid var(--rule); background: var(--panel); border-radius: 6px; padding: 5px 12px; cursor: pointer;
+  }
+  .btn:hover { border-color: var(--muted); }
+  .btn.kill { border-color: var(--warn); color: var(--warn); font-weight: 600; }
+  .btn.kill[aria-pressed="true"] { background: var(--warn); color: #fff; }
+
+  main {
+    display: grid; gap: 1px; background: var(--rule);
+    grid-template-columns: 300px minmax(380px, 1fr) 280px;
+    grid-template-areas: "ticket ladder tape" "orders orders events";
+  }
+  main > section { background: var(--bg); padding: 14px 16px; min-width: 0; }
+  #ticket { grid-area: ticket; } #ladder-box { grid-area: ladder; } #tape-box { grid-area: tape; }
+  #orders-box { grid-area: orders; } #events-box { grid-area: events; }
+  @media (max-width: 1000px) {
+    main { grid-template-columns: 1fr; grid-template-areas: "ladder" "ticket" "orders" "tape" "events"; }
+  }
+
+  /* Order ticket */
+  form { display: grid; gap: 10px; }
+  .side { display: grid; grid-template-columns: 1fr 1fr; border: 1px solid var(--rule); border-radius: 8px; overflow: hidden; }
+  .side input { position: absolute; opacity: 0; pointer-events: none; }
+  .side label { text-align: center; padding: 7px 0; cursor: pointer; font-weight: 600; }
+  .side input:focus-visible + label { outline: 2px solid var(--action); outline-offset: -2px; }
+  #buy:checked + label { background: var(--bid); color: #fff; }
+  #sell:checked + label { background: var(--ask); color: #fff; }
+  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .field { display: grid; gap: 3px; font-size: 12px; color: var(--muted); }
+  .row2 > *, .field { min-width: 0; }
+  .field input, .field select {
+    width: 100%; min-width: 0;
+    border: 1px solid var(--rule); border-radius: 6px; padding: 6px 8px; background: #fff; font-size: 14px;
+  }
+  .send { border: 0; border-radius: 8px; padding: 9px; color: #fff; font-weight: 650; cursor: pointer; background: var(--bid); }
+  .send.sell { background: var(--ask); }
+  .hint { font-size: 12px; color: var(--muted); margin: 0; }
+  .msg { min-height: 1.4em; font-size: 13px; margin: 0; }
+  .msg.err { color: var(--ask); }
+  dl.risk { display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; margin: 18px 0 0; font-size: 13px; }
+  dl.risk dt { color: var(--muted); } dl.risk dd { margin: 0; text-align: right; }
+  .risk-head { margin-top: 20px; }
+  .killed { background: var(--warn-tint); color: var(--warn); padding: 6px 8px; border-radius: 6px; font-size: 13px; margin-top: 8px; }
+
+  /* Ladder: the one loud thing on the page */
+  .ladder { width: 100%; border-collapse: collapse; }
+  .ladder td { padding: 0; height: 24px; }
+  .ladder button {
+    width: 100%; height: 24px; border: 0; background: transparent; cursor: pointer; position: relative;
+    display: flex; align-items: center; padding: 0 8px;
+  }
+  .ladder .bidcell button { justify-content: flex-end; }
+  .ladder .bar { position: absolute; top: 3px; bottom: 3px; border-radius: 2px; }
+  .ladder .bidcell .bar { right: 0; background: var(--bid-tint); }
+  .ladder .askcell .bar { left: 0; background: var(--ask-tint); }
+  .ladder .qty { position: relative; }
+  .ladder .bidcell button:hover { box-shadow: inset 0 0 0 1px var(--bid); }
+  .ladder .askcell button:hover { box-shadow: inset 0 0 0 1px var(--ask); }
+  .ladder .price { text-align: center; width: 92px; font-weight: 600; border-left: 1px solid var(--rule); border-right: 1px solid var(--rule); }
+  .ladder tr.best-bid .price { color: var(--bid); } .ladder tr.best-ask .price { color: var(--ask); }
+  .ladder tr.best-bid td, .ladder tr.best-ask td { border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); }
+  .ladder .mine { width: 88px; font-size: 12px; font-weight: 650; }
+  .ladder .mine.b { text-align: right; color: var(--bid); padding-right: 8px; }
+  .ladder .mine.s { color: var(--ask); padding-left: 8px; }
+  .ladder th { font-size: 12px; font-weight: 600; color: var(--muted); padding: 0 8px 6px; }
+  .ladder th.r { text-align: right; } .ladder th.l { text-align: left; }
+  .ladder th.price { font-weight: 600; color: var(--muted); }
+  .ladder-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+  .ladder-head p { margin: 0 0 8px; color: var(--muted); font-size: 12px; }
+
+  /* Tables */
+  table.list { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.list th { text-align: left; font-weight: 600; color: var(--muted); font-size: 12px; padding: 4px 6px; border-bottom: 1px solid var(--rule); }
+  table.list td { padding: 4px 6px; border-bottom: 1px solid #E1E8EA; white-space: nowrap; }
+  table.list td.n, table.list th.n { text-align: right; }
+  #events td { white-space: normal; vertical-align: top; }
+  .buy { color: var(--bid); font-weight: 600; } .sell { color: var(--ask); font-weight: 600; }
+  .state-filled { color: var(--bid); } .state-rejected, .state-cancelled, .state-expired { color: var(--muted); }
+  .link { border: 0; background: none; color: var(--action); cursor: pointer; padding: 0 4px; }
+  .scroll { max-height: 340px; overflow: auto; }
+  .empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
+  #modify { display: none; gap: 8px; align-items: end; margin-bottom: 10px; padding: 8px; border: 1px solid var(--rule); border-radius: 8px; }
+  #modify.open { display: flex; flex-wrap: wrap; }
+  .banner { display: none; background: var(--warn-tint); color: var(--warn); padding: 8px 16px; font-size: 13px; }
+  .banner.show { display: block; }
+  @media (prefers-reduced-motion: no-preference) { .flash { animation: flash 0.6s ease-out; } }
+  @keyframes flash { from { background: var(--warn-tint); } to { background: transparent; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Engine test bench</h1>
+  <div class="tabs" id="tabs" role="group" aria-label="Symbol"></div>
+  <div class="readout" aria-live="off">
+    <span>Requests <b id="st-req">0</b></span>
+    <span>Engine time per request p50 <b id="st-p50">–</b> · p99 <b id="st-p99">–</b> · p99.9 <b id="st-p999">–</b></span>
+    <span>Resting orders <b id="st-rest">0</b></span>
+  </div>
+  <div class="controls">
+    <label>Background flow
+      <input type="range" id="flow" min="0" max="5000" step="50" value="200" aria-describedby="flow-val">
+      <b id="flow-val">200/s</b>
+    </label>
+    <button class="btn" id="burst" title="Send 200,000 background orders as fast as the engine takes them">Run 200k-order burst</button>
+    <button class="btn" id="reset">Reset session</button>
+    <button class="btn kill" id="kill" aria-pressed="false">Kill switch</button>
+  </div>
+</header>
+<div class="banner" id="down" role="alert">The engine isn't answering. Start it with <code>./build/web_ui</code>, then this page reconnects by itself.</div>
+<p class="banner" id="burst-out" role="status"></p>
+
+<main>
+  <section id="ticket" aria-labelledby="ticket-h">
+    <h2 id="ticket-h">New order</h2>
+    <form id="order">
+      <div class="side">
+        <input type="radio" name="side" id="buy" value="buy" checked><label for="buy">Buy</label>
+        <input type="radio" name="side" id="sell" value="sell"><label for="sell">Sell</label>
+      </div>
+      <div class="row2">
+        <label class="field">Type
+          <select name="type" id="type"><option value="limit">Limit</option><option value="market">Market</option><option value="stop">Stop limit</option></select>
+        </label>
+        <label class="field">Time in force
+          <select name="tif" id="tif"><option value="day">Day</option><option value="gtc">Good till cancel</option><option value="ioc">Immediate or cancel</option><option value="fok">Fill or kill</option></select>
+        </label>
+      </div>
+      <div class="row2">
+        <label class="field">Limit price ($)<input name="px" id="px" inputmode="decimal" autocomplete="off"></label>
+        <label class="field">Quantity<input name="qty" id="qty" inputmode="numeric" value="100" autocomplete="off"></label>
+      </div>
+      <label class="field" id="stop-field" hidden>Stop price ($): enters the book once a trade prints at or through it
+        <input name="stop" id="stop" inputmode="decimal" autocomplete="off">
+      </label>
+      <label class="field">Trade as
+        <select name="who" id="who"><option value="me">Me: through the OMS and risk checks</option><option value="other">Another trader: straight to the venue</option></select>
+      </label>
+      <button class="send" id="send" type="submit">Send buy order</button>
+      <p class="msg" id="msg" role="status"></p>
+      <p class="hint">Or click a row in the book: left side buys at that price, right side sells, with the quantity above.</p>
+    </form>
+
+    <h2 class="risk-head">Risk on this symbol</h2>
+    <dl class="risk" id="risk"></dl>
+    <div class="killed" id="killed" hidden>Kill switch is on. Every new order is refused until you reset the session.</div>
+  </section>
+
+  <section id="ladder-box" aria-labelledby="ladder-h">
+    <div class="ladder-head">
+      <h2 id="ladder-h">Book</h2>
+      <p id="spread"></p>
+    </div>
+    <table class="ladder" aria-describedby="ladder-h">
+      <thead><tr><th class="mine b">Yours</th><th class="r">Bids</th><th class="price">Price</th><th class="l">Asks</th><th class="mine s">Yours</th></tr></thead>
+      <tbody id="ladder"></tbody>
+    </table>
+  </section>
+
+  <section id="tape-box" aria-labelledby="tape-h">
+    <h2 id="tape-h">Trades</h2>
+    <div class="scroll"><table class="list"><thead><tr><th>Time</th><th class="n">Price</th><th class="n">Qty</th></tr></thead><tbody id="tape"></tbody></table></div>
+  </section>
+
+  <section id="orders-box" aria-labelledby="orders-h">
+    <h2 id="orders-h">My orders</h2>
+    <form id="modify" aria-label="Modify order">
+      <strong id="mod-title"></strong>
+      <label class="field">New price ($)<input id="mod-px" inputmode="decimal"></label>
+      <label class="field">New total quantity<input id="mod-qty" inputmode="numeric"></label>
+      <button class="btn" type="submit">Save changes</button>
+      <button class="btn" type="button" id="mod-close">Keep as is</button>
+    </form>
+    <div class="scroll"><table class="list">
+      <thead><tr><th>#</th><th>Symbol</th><th>Side</th><th>Type</th><th class="n">Price</th><th class="n">Qty</th><th class="n">Filled</th><th class="n">Open</th><th class="n">Avg</th><th class="n" title="Shares queued in front of this order at its price">Ahead in queue</th><th>Status</th><th></th></tr></thead>
+      <tbody id="orders"></tbody>
+    </table></div>
+  </section>
+
+  <section id="events-box" aria-labelledby="events-h">
+    <h2 id="events-h">Execution reports</h2>
+    <div class="scroll"><table class="list"><tbody id="events"></tbody></table></div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const money = v => v == null ? "–" : v.toFixed(2);
+const int = v => v == null ? "–" : v.toLocaleString("en-US");
+const ns = v => v >= 1000 ? (v / 1000).toFixed(1) + " µs" : v + " ns";
+const time = ms => new Date(ms).toLocaleTimeString("en-GB", { hour12: false }) + "." + String(ms % 1000).padStart(3, "0");
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+let sym = 0, symbols = [], lastTape = null, editing = null, priceTouched = false;
+
+async function post(path, data) {
+  const r = await fetch(path, { method: "POST", body: new URLSearchParams(data) });
+  const j = await r.json().catch(() => ({}));
+  return j.error || "";
+}
+
+function say(text, isErr) {
+  const m = $("msg");
+  m.textContent = text;
+  m.className = "msg" + (isErr ? " err" : "");
+}
+
+// Ticket
+const sideNow = () => document.querySelector('input[name="side"]:checked').value;
+function syncTicket() {
+  const s = sideNow(), t = $("type").value;
+  $("send").textContent = "Send " + s + " order";
+  $("send").className = "send" + (s === "sell" ? " sell" : "");
+  $("stop-field").hidden = t !== "stop";
+  $("px").disabled = t === "market";
+  $("tif").disabled = t === "market";
+}
+document.querySelectorAll('input[name="side"], #type').forEach(e => e.addEventListener("change", syncTicket));
+$("px").addEventListener("input", () => { priceTouched = true; });
+$("order").addEventListener("submit", async e => {
+  e.preventDefault();
+  const data = Object.fromEntries(new FormData($("order")));
+  data.sym = symbols[sym];
+  data.type = $("type").value; data.tif = $("tif").value;
+  const err = await post("/api/order", data);
+  say(err || "Sent.", !!err);
+});
+
+// Clicking the book: left half buys, right half sells, at that row's price.
+$("ladder").addEventListener("click", async e => {
+  const b = e.target.closest("button[data-px]");
+  if (!b) return;
+  const side = b.dataset.side;
+  const err = await post("/api/order", { sym: symbols[sym], side, type: "limit", tif: $("tif").value === "fok" || $("tif").value === "ioc" ? "day" : $("tif").value,
+                                         px: b.dataset.px, qty: $("qty").value, who: $("who").value });
+  say(err || `Sent: ${side} ${$("qty").value} at ${b.dataset.px}.`, !!err);
+});
+
+// Orders: cancel and modify
+$("orders").addEventListener("click", async e => {
+  const b = e.target.closest("button[data-act]");
+  if (!b) return;
+  if (b.dataset.act === "cancel") {
+    const err = await post("/api/cancel", { cl: b.dataset.cl });
+    say(err || `Cancel sent for #${b.dataset.cl}.`, !!err);
+  } else {
+    editing = b.dataset.cl;
+    $("mod-title").textContent = "Modify #" + editing;
+    $("mod-px").value = b.dataset.px; $("mod-qty").value = b.dataset.qty;
+    $("modify").classList.add("open");
+    $("mod-px").focus();
+  }
+});
+$("mod-close").addEventListener("click", () => { editing = null; $("modify").classList.remove("open"); });
+$("modify").addEventListener("submit", async e => {
+  e.preventDefault();
+  const err = await post("/api/replace", { cl: editing, px: $("mod-px").value, qty: $("mod-qty").value });
+  say(err || `Modify sent for #${editing}.`, !!err);
+  if (!err) { editing = null; $("modify").classList.remove("open"); }
+});
+
+// Header controls
+$("flow").addEventListener("input", () => { $("flow-val").textContent = $("flow").value + "/s"; });
+$("flow").addEventListener("change", () => post("/api/flow", { rate: $("flow").value }));
+$("burst").addEventListener("click", async () => {
+  $("burst").disabled = true;
+  await post("/api/burst", { n: 200000 });
+  $("burst").disabled = false;
+});
+$("reset").addEventListener("click", async () => { await post("/api/reset", {}); lastTape = null; say("New session: books, orders and risk start fresh.", false); });
+$("kill").addEventListener("click", async () => { await post("/api/kill", {}); say("Kill switch on: working orders cancelled.", false); });
+
+function render(s) {
+  symbols = s.symbols;
+  $("tabs").innerHTML = s.symbols.map((n, i) => `<button type="button" data-i="${i}" aria-pressed="${i === s.sym}">${esc(n)}</button>`).join("");
+  $("st-req").textContent = int(s.stats.requests);
+  $("st-p50").textContent = ns(s.stats.p50); $("st-p99").textContent = ns(s.stats.p99); $("st-p999").textContent = ns(s.stats.p999);
+  $("st-rest").textContent = int(s.stats.resting);
+  const bo = $("burst-out");
+  bo.textContent = s.stats.burst ? "Last burst: " + s.stats.burst + "." : ""; bo.classList.toggle("show", !!s.stats.burst);
+
+  // Ladder
+  const max = Math.max(1, ...s.ladder.map(r => Math.max(r[1], r[2])));
+  $("ladder").innerHTML = s.ladder.map(([px, b, a, mb, ma]) => {
+    const p = px.toFixed(2);
+    const cls = px === s.bid ? "best-bid" : px === s.ask ? "best-ask" : "";
+    return `<tr class="${cls}">
+      <td class="mine b">${mb ? int(mb) : ""}</td>
+      <td class="bidcell"><button type="button" data-px="${p}" data-side="buy" aria-label="Buy at ${p}, ${int(b)} bid"><span class="bar" style="width:${(b / max) * 100}%"></span><span class="qty">${b ? int(b) : ""}</span></button></td>
+      <td class="price">${p}</td>
+      <td class="askcell"><button type="button" data-px="${p}" data-side="sell" aria-label="Sell at ${p}, ${int(a)} offered"><span class="bar" style="width:${(a / max) * 100}%"></span><span class="qty">${a ? int(a) : ""}</span></button></td>
+      <td class="mine s">${ma ? int(ma) : ""}</td></tr>`;
+  }).join("");
+  $("spread").textContent = s.bid != null && s.ask != null
+    ? `Best bid ${money(s.bid)}, best ask ${money(s.ask)}, spread ${(s.ask - s.bid).toFixed(2)}. Your resting size shows at the edges.`
+    : "One side of the book is empty.";
+  if (!priceTouched && s.bid != null) $("px").value = money(sideNow() === "buy" ? s.bid : s.ask);
+
+  // Tape
+  const fresh = s.tape.length ? s.tape[0][0] : null;
+  $("tape").innerHTML = s.tape.length ? s.tape.map(([t, px, q, buy], i) =>
+    `<tr${i === 0 && fresh !== lastTape && lastTape !== null ? ' class="flash"' : ""}><td>${time(t)}</td><td class="n ${buy ? "buy" : "sell"}">${money(px)}</td><td class="n">${int(q)}</td></tr>`).join("")
+    : `<tr><td class="empty" colspan="3">No trades yet on this symbol.</td></tr>`;
+  lastTape = fresh;
+
+  // My orders
+  $("orders").innerHTML = s.orders.length ? s.orders.map(o => {
+    const open = !["filled", "cancelled", "rejected", "expired"].includes(o.state);
+    const acts = open ? `<button class="link" data-act="cancel" data-cl="${o.cl}">Cancel</button>` +
+      (o.type === "limit" ? `<button class="link" data-act="modify" data-cl="${o.cl}" data-px="${money(o.px)}" data-qty="${o.qty}">Modify</button>` : "") : "";
+    return `<tr><td>${o.cl}</td><td>${esc(o.sym)}</td><td class="${o.side}">${o.side}</td><td>${o.type}, ${o.tif}</td>
+      <td class="n">${o.type === "market" ? "market" : money(o.px)}</td><td class="n">${int(o.qty)}</td><td class="n">${int(o.cum)}</td><td class="n">${int(o.leaves)}</td>
+      <td class="n">${money(o.avg)}</td><td class="n">${o.ahead == null ? "" : int(o.ahead)}</td>
+      <td class="state-${o.state.split(" ")[0]}" title="${esc(o.reject)}">${o.state}${o.reject ? ": " + esc(o.reject) : ""}</td><td>${acts}</td></tr>`;
+  }).join("") : `<tr><td class="empty" colspan="12">No orders yet. Send one from the ticket or click a price in the book.</td></tr>`;
+
+  // Execution reports
+  $("events").innerHTML = s.events.length ? s.events.map(([t, cl, who, what, why, px, q, left]) =>
+    `<tr><td>${time(t)}</td><td>${who === "me" ? "#" + cl : "other #" + cl}</td><td>${esc(what)}${why ? ": " + esc(why) : ""}${q ? ` ${int(q)} at ${money(px)}` : ""}${what === "Rejected" ? "" : `, ${int(left)} open`}</td></tr>`).join("")
+    : `<tr><td class="empty">Reports for your orders show up here.</td></tr>`;
+
+  // Risk
+  const r = s.risk;
+  $("risk").innerHTML = `
+    <dt>Position</dt><dd class="${r.position > 0 ? "buy" : r.position < 0 ? "sell" : ""}">${int(r.position)} / ${int(r.max_position)}</dd>
+    <dt>Open buy / sell qty</dt><dd>${int(r.open_buy)} / ${int(r.open_sell)}</dd>
+    <dt>Open orders, all symbols</dt><dd>${int(r.open_orders)} / ${int(r.max_open_orders)}</dd>
+    <dt>P&amp;L, all symbols</dt><dd class="${r.pnl > 0 ? "buy" : r.pnl < 0 ? "sell" : ""}">$${money(r.pnl)}</dd>
+    <dt>Largest order</dt><dd>${int(r.max_order_qty)}</dd>
+    <dt>Price band around mid</dt><dd>${r.collar_pct}%</dd>
+    <dt>Stop trading at a loss of</dt><dd>$${int(r.max_loss)}</dd>`;
+  $("killed").hidden = !r.killed;
+  $("kill").setAttribute("aria-pressed", r.killed);
+  if (document.activeElement !== $("flow")) { $("flow").value = s.stats.flow; $("flow-val").textContent = Math.round(s.stats.flow) + "/s"; }
+}
+
+$("tabs").addEventListener("click", e => {
+  const b = e.target.closest("button[data-i]");
+  if (b) { sym = +b.dataset.i; priceTouched = false; lastTape = null; }
+});
+
+async function loop() {
+  try {
+    const r = await fetch("/api/state?sym=" + sym);
+    render(await r.json());
+    $("down").classList.remove("show");
+  } catch (e) {
+    $("down").classList.add("show");
+  }
+  setTimeout(loop, 150);
+}
+syncTicket();
+loop();
+</script>
+</body>
+</html>
