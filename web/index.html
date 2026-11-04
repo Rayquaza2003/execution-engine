@@ -49,7 +49,7 @@
   .btn.play { border-color: var(--action); color: var(--action); font-weight: 600; min-width: 72px; }
   .progress { width: 90px; height: 6px; border-radius: 3px; background: var(--rule); overflow: hidden; }
   .progress span { display: block; height: 100%; background: var(--action); width: 0; }
-  .tabs button:disabled { opacity: 0.45; cursor: not-allowed; }
+  .tabs button:disabled, .btn:disabled { opacity: 0.45; cursor: not-allowed; }
   .replay-note { margin: 0 0 10px; font-size: 13px; color: var(--muted); max-width: 72ch; }
   .btn {
     border: 1px solid var(--rule); background: var(--panel); border-radius: 6px; padding: 5px 12px; cursor: pointer;
@@ -134,6 +134,7 @@
   .empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
   #modify { display: none; gap: 8px; align-items: end; margin-bottom: 10px; padding: 8px; border: 1px solid var(--rule); border-radius: 8px; }
   #modify.open { display: flex; flex-wrap: wrap; }
+  #modify .msg { flex-basis: 100%; margin: 0; }
   .banner { display: none; background: var(--warn-tint); color: var(--warn); padding: 8px 16px; font-size: 13px; }
   .banner.show { display: block; }
   @media (prefers-reduced-motion: no-preference) { .flash { animation: flash 0.6s ease-out; } }
@@ -238,8 +239,9 @@
       <strong id="mod-title"></strong>
       <label class="field">New price ($)<input id="mod-px" inputmode="decimal"></label>
       <label class="field">New total quantity<input id="mod-qty" inputmode="numeric"></label>
-      <button class="btn" type="submit">Save changes</button>
-      <button class="btn" type="button" id="mod-close">Keep as is</button>
+      <button class="btn" type="submit" id="mod-save">Save changes</button>
+      <button class="btn" type="button" id="mod-close">Close</button>
+      <p class="msg" id="mod-msg" role="status"></p>
     </form>
     <div class="scroll"><table class="list">
       <thead><tr><th>#</th><th>Symbol</th><th>Side</th><th>Type</th><th class="n">Price</th><th class="n">Qty</th><th class="n">Filled</th><th class="n">Open</th><th class="n">Avg</th><th class="n" title="Shares queued in front of this order at its price">Ahead in queue</th><th>Status</th><th></th></tr></thead>
@@ -319,16 +321,24 @@ $("orders").addEventListener("click", async e => {
     editing = b.dataset.cl;
     $("mod-title").textContent = "Modify #" + editing;
     $("mod-px").value = b.dataset.px; $("mod-qty").value = b.dataset.qty;
+    modSay("", false);
     $("modify").classList.add("open");
     $("mod-px").focus();
   }
 });
+// Messages about a modify show next to the modify form, where you're looking.
+function modSay(text, isErr) {
+  $("mod-msg").textContent = text;
+  $("mod-msg").className = "msg" + (isErr ? " err" : "");
+}
 $("mod-close").addEventListener("click", () => { editing = null; $("modify").classList.remove("open"); });
 $("modify").addEventListener("submit", async e => {
   e.preventDefault();
   const err = await post("/api/replace", { cl: editing, px: $("mod-px").value, qty: $("mod-qty").value });
-  say(err || `Modify sent for #${editing}.`, !!err);
-  if (!err) { editing = null; $("modify").classList.remove("open"); }
+  if (err) return modSay(err, true);
+  say(`Modify sent for #${editing}.`, false);
+  editing = null;
+  $("modify").classList.remove("open");
 });
 
 // Header controls
@@ -416,6 +426,14 @@ function render(s) {
     `<tr${i === 0 && fresh !== lastTape && lastTape !== null ? ' class="flash"' : ""}><td>${time(t)}</td><td class="n ${buy ? "buy" : "sell"}">${money(px)}</td><td class="n">${int(q)}</td></tr>`).join("")
     : `<tr><td class="empty" colspan="3">No trades yet on this symbol.</td></tr>`;
   lastTape = fresh;
+
+  // An order can fill or be cancelled while you're editing it: say so, and stop the save.
+  if (editing) {
+    const o = s.orders.find(x => String(x.cl) === String(editing));
+    const done = !o || ["filled", "cancelled", "rejected", "expired"].includes(o.state);
+    $("mod-save").disabled = done;
+    if (done) modSay(o ? `#${editing} is ${o.state} now (${int(o.cum)} filled), so there is nothing left to modify.` : `#${editing} is no longer listed.`, true);
+  }
 
   // My orders
   $("orders").innerHTML = s.orders.length ? s.orders.map(o => {
