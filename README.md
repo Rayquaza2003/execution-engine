@@ -64,7 +64,7 @@ The two sides share no memory. They exchange messages only, as a firm and an exc
 | router | `src/sor/` | Water-fills an order across venues by all-in cost per share. Picks a venue to rest on by expected value. Three venues are carved out of one real feed. |
 | concurrency | `src/core/spsc.hpp`, `histogram.hpp`, `logger.hpp` | A lock-free SPSC queue, a log-linear latency histogram and an async logger. |
 | FIX | `src/fix/` | A tag=value codec with BodyLength and CheckSum. Sessions handle sequence numbers, gaps with exact resends, PossDup, GapFill, heartbeats and resets. |
-| gateway | `src/net/gateway.hpp` | A `poll()` TCP server. Converts FIX order messages (D, F, G, AF) into matching-engine requests on another thread, and sends back execution reports and cancel rejects (8, 9). |
+| gateway | `src/net/gateway.hpp` | A `poll()` TCP server. Converts FIX order messages (D, F, G, AF) into matching-engine requests on another thread, and sends back execution reports and cancel rejects (8, 9). Logons need a username and password, and every order is checked against hard quantity and price limits. |
 | journal | `src/journal/journal.hpp` | An append-only binary journal with a CRC32 per record and torn-tail recovery. The gateway journals write-ahead and recovers from it. |
 
 ## Results
@@ -120,11 +120,17 @@ Benchmarks that need no data:
 
 ### FIX gateway and load generator
 
+Passwords are kept out of argv, because `ps` shows argv. The gateway reads
+`COMPID PASSWORD` lines from a file, and the client reads `FIX_PASSWORD`.
+
 ```sh
-./build/fix_gateway --journal /tmp/gw.journal 9878 AAPL MSFT &
+echo "LOADGEN $(openssl rand -hex 16)" > users.txt && chmod 600 users.txt
+export FIX_PASSWORD=$(cut -d' ' -f2 users.txt)
+
+./build/fix_gateway --users users.txt --journal /tmp/gw.journal 9878 AAPL MSFT &
 ./build/fix_client 9878 AAPL 100000 1     # one request in flight: wire-to-wire latency
 ./build/fix_client 9878 AAPL 200000 64    # 64 in flight: throughput
-kill -9 %1; ./build/fix_gateway --journal /tmp/gw.journal 9878 AAPL MSFT   # recovers from the journal
+kill -9 %1; ./build/fix_gateway --users users.txt --journal /tmp/gw.journal 9878 AAPL MSFT   # recovers
 ```
 
 ### Real market data
@@ -195,6 +201,8 @@ Deliberate shortcuts are marked in the code with `ponytail:` comments. The main 
   - No cancel-on-disconnect.
   - No session-level Reject (35=3).
   - The resend store lives in memory as well as in the journal.
+  - It binds to loopback only, and FIX travels in plaintext with no TLS, so the logon
+    password is only as private as the link.
 - **Benchmark platform:** macOS, with no core pinning and a 41.67 ns clock tick. Numbers
   on Linux with pinned, isolated cores are still to do.
 - **Data:** one morning of one day; studies need more days before any parameter is fitted.
