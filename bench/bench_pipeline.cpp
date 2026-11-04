@@ -20,14 +20,13 @@
 // Idle threads busy-spin with a CPU hint. Yielding to the OS when idle was
 // tried and made tails ~50x worse on macOS: a yielding thread gets parked.
 //
-// Usage: ./build/bench_pipeline [ITCH_FILE SYMBOL...]   (default: synthetic feed)
-// macOS can't pin threads; the clock ticks every 41.67 ns on Apple silicon.
+// Usage: [PIN_CPUS=a,b,c,d] ./build/bench_pipeline [ITCH_FILE SYMBOL...]   (default: synthetic feed)
+// PIN_CPUS pins feed, venue, md, strategy to those CPUs (Linux). macOS can't
+// pin threads; the clock ticks every 41.67 ns on Apple silicon.
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
-#include <pthread.h>
 
 #include <array>
 #include <atomic>
@@ -39,6 +38,7 @@
 #include <variant>
 #include <vector>
 
+#include "core/affinity.hpp"
 #include "core/histogram.hpp"
 #include "core/logger.hpp"
 #include "core/spsc.hpp"
@@ -48,12 +48,6 @@
 
 static uint64_t now() { return Logger::now_ns(); }
 
-// No core pinning on macOS; the highest QoS class steers a thread to the performance cores.
-static void fast_thread() {
-#ifdef __APPLE__
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-#endif
-}
 
 struct End {};
 using Item = std::variant<End, itch::StockDirectory, itch::Add, itch::Execute, itch::Cancel, itch::Delete, itch::Replace>;
@@ -138,7 +132,7 @@ static void run(const std::vector<FeedMsg>& feed, const std::vector<std::string>
     size_t nsym = want.size();
 
     std::thread venue_t([&] {
-        fast_thread();
+        place_thread(1);
         Venue venue;
         ItchReplay replay(venue, want);
         VenueOut out;
@@ -186,7 +180,7 @@ static void run(const std::vector<FeedMsg>& feed, const std::vector<std::string>
     });
 
     std::thread md_t([&] {
-        fast_thread();
+        place_thread(2);
         MarketData md(1, nsym);
         MdMsg m;
         for (;;) {
@@ -209,7 +203,7 @@ static void run(const std::vector<FeedMsg>& feed, const std::vector<std::string>
     });
 
     std::thread strategy_t([&] {
-        fast_thread();
+        place_thread(3);
         Chaser chaser(nsym);
         Logger::Channel& log = logger.channel(0);
         std::vector<VenueRequest> reqs;
@@ -244,7 +238,7 @@ static void run(const std::vector<FeedMsg>& feed, const std::vector<std::string>
     });
 
     // Feed: this thread.
-    fast_thread();
+    place_thread(0);
     p->t_start = now();
     for (size_t i = 0; i < feed.size(); ++i) {
         if (rate > 0)

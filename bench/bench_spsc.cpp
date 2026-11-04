@@ -5,8 +5,8 @@
 //   round trip: thread A pushes a timestamp, B echoes it back on a second
 //               queue, A records the round trip; one message in flight
 //
-// macOS can't pin threads to cores, so placement (and P vs E cores) is up to
-// the scheduler; medians over 5 runs.
+// PIN_CPUS=a,b pins the two threads (Linux). macOS can't pin threads to cores,
+// so there placement (and P vs E cores) is up to the scheduler; medians over 5 runs.
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -18,6 +18,7 @@
 #include <thread>
 #include <vector>
 
+#include "core/affinity.hpp"
 #include "core/histogram.hpp"
 #include "core/spsc.hpp"
 
@@ -56,6 +57,7 @@ double throughput(uint64_t n) {
     auto q = std::make_unique<Q>();
     uint64_t t0 = now_ns();
     std::thread producer([&] {
+        place_thread(1);
         for (uint64_t i = 0; i < n; ++i)
             while (!q->try_push(i)) {
             }
@@ -72,6 +74,7 @@ template <class Q>
 Histogram round_trip(uint64_t n) {
     auto there = std::make_unique<Q>(), back = std::make_unique<Q>();
     std::thread echo([&] {
+        place_thread(1);
         uint64_t v;
         for (uint64_t i = 0; i < n; ++i) {
             while (!there->try_pop(v)) {
@@ -109,6 +112,7 @@ void run(const char* name, uint64_t n) {
 }
 
 int main(int argc, char** argv) {
+    place_thread(0);
     uint64_t n = argc > 1 ? std::strtoull(argv[1], nullptr, 10) : 20'000'000;
     run<Spsc<uint64_t, kCap>>("spsc", n);
     run<Locked<uint64_t, kCap>>("mutex", n);
