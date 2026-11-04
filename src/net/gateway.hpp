@@ -42,7 +42,8 @@
 // application messages through the same code, straight into the matching
 // engine, which rebuilds the books and the order table exactly.
 //
-// Clients authenticate on Logon (Username/Password against GatewayConfig::users).
+// Clients authenticate on Logon (Username/Password against GatewayConfig::users);
+// orders are checked against hard per-order limits before they reach the book.
 // Sessions are never shared: one connection per CompID at a time.
 //
 // Both threads busy-poll: lowest latency, one core each.
@@ -62,6 +63,10 @@ struct GatewayConfig {
 
 class Gateway {
 public:
+    // Per-order limits at the venue's door, whatever the client's own risk says.
+    static constexpr int64_t kMaxQty = 10'000'000;
+    static constexpr Price kMaxPrice = 100'000'000;  // ticks: $1,000,000.00
+
     Gateway(std::vector<std::string> symbols, GatewayConfig cfg)
         : symbols_(std::move(symbols)), comp_(cfg.comp_id), fsync_(cfg.fsync), users_(std::move(cfg.users)),
           max_held_(cfg.max_held) {
@@ -387,6 +392,9 @@ private:
         ++inflight_;
     }
 
+    static bool qty_ok(std::optional<int64_t> q) { return q && *q > 0 && *q <= kMaxQty; }
+    static bool price_ok(std::optional<Price> p) { return p && *p > 0 && *p <= kMaxPrice; }
+
     // Username must be the SenderCompID; the password is compared in constant
     // time, so response timing doesn't reveal how much of a guess was right.
     bool authenticated(const fix::Message& m, const std::string& comp) const {
@@ -426,10 +434,10 @@ private:
                               : c.by_cl.count(cl) ? "duplicate ClOrdID"
                               : !sym ? "unknown symbol"
                               : side != "1" && side != "2" ? "bad Side"
-                              : !qty || *qty <= 0 ? "bad OrderQty"
+                              : !qty_ok(qty) ? "bad OrderQty"
                               : ord != "1" && ord != "2" ? "unsupported OrdType"
-                              : ord == "2" && !px ? "bad Price"
-                                                  : nullptr;
+                              : ord == "2" && !price_ok(px) ? "bad Price"
+                                                            : nullptr;
             if (why) return reject_new(c, cl, why, t);
             Tif tif = Tif::Day;
             std::string_view tv = m.get(fix::TimeInForce).value_or("0");
@@ -458,7 +466,7 @@ private:
         if (!replace) return submit(CancelRequest{it->second, o.sym});
         std::optional<int64_t> qty = m.get_int(fix::OrderQty);
         std::optional<Price> px = m.get(fix::Price) ? fix::to_price(*m.get(fix::Price)) : std::nullopt;
-        if (!qty || !px || Qty(*qty) <= o.cum) {
+        if (!qty_ok(qty) || !price_ok(px) || Qty(*qty) <= o.cum) {  // checked before the cast to unsigned
             o.pending_cl.clear();
             return cancel_reject(c, cl, orig, true, "bad Price or OrderQty", t);
         }

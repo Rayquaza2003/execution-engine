@@ -337,6 +337,43 @@ static void test_logon_needs_credentials_and_no_takeover() {
     assert(gw.auth_failures() == 4);
 }
 
+// Hard per-order limits at the door: quantity in (0, 10M], limit price in
+// (0, $1M], on new orders and on replaces (where -1 used to become 2^64 - 1).
+static void test_order_limits() {
+    Gateway gw({"AAPL"}, config());
+    std::atomic<bool> stop{false};
+    std::thread server([&] { gw.run(stop); });
+    {
+        Client buyer(gw.port(), "BUYER");
+        int n = 0;
+        auto rejected = [&](const char* qty, const char* px, const char* why) {
+            std::string cl = "x" + std::to_string(++n);
+            buyer.order(cl.c_str(), '1', qty, px);
+            Fields f = buyer.expect(cl);
+            return f[fix::ExecType] == "8" && f[fix::Text] == why;
+        };
+        assert(rejected("-1", "10.00", "bad OrderQty") && rejected("0", "10.00", "bad OrderQty"));
+        assert(rejected("10000001", "10.00", "bad OrderQty") && rejected("18446744073709551615", "10.00", "bad OrderQty"));
+        assert(rejected("100", "-5.00", "bad Price") && rejected("100", "0", "bad Price"));
+        assert(rejected("100", "1000000.01", "bad Price") && rejected("100", "99999999999999999.00", "bad Price"));
+
+        buyer.order("b1", '1', "100", "10.00");
+        assert(buyer.expect("b1")[fix::ExecType] == "0");
+        for (auto [cl, qty, px] : {std::tuple{"r1", "-1", "10.00"}, {"r2", "100", "-5.00"}, {"r3", "0", "10.00"}}) {
+            buyer.s.send("G", Gateway::now(), [&](fix::Writer& w) {
+                w.field(fix::ClOrdID, cl).field(fix::OrigClOrdID, "b1").field(fix::Symbol, "AAPL").field(fix::Side, '1');
+                w.field(fix::OrderQty, qty).field(fix::OrdType, '2').field(fix::Price, px);
+            });
+            Fields f = buyer.expect(cl);
+            assert(f[fix::MsgType] == "9" && f[fix::Text] == "bad Price or OrderQty");
+        }
+        std::vector<Fields> st = buyer.mass_status("m");
+        assert(st.size() == 1 && st[0][fix::ClOrdID] == "b1" && st[0][fix::LeavesQty] == "100");
+    }
+    stop = true;
+    server.join();
+}
+
 // A client that floods messages beyond a sequence gap is logged out and cut
 // off once it passes the hold limit, instead of growing memory without end;
 // everyone else carries on.
@@ -392,6 +429,7 @@ static void test_big_gap_fill_does_not_deadlock() {
 
 int main() {
     test_logon_needs_credentials_and_no_takeover();
+    test_order_limits();
     test_flood_beyond_gap_is_cut_off();
     test_big_gap_fill_does_not_deadlock();
     test_crash_and_recover_from_journal();
