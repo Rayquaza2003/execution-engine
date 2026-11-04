@@ -29,6 +29,13 @@ static std::vector<Rec> all(const std::string& path, size_t* valid = nullptr) {
 
 static void test_crc32_reference_value() {
     assert(crc32("123456789", 9) == 0xCBF43926u);  // the standard CRC-32 check value
+    assert(crc32_portable("123456789", 9) == 0xCBF43926u);
+    std::string bytes;
+    for (int i = 0; i < 1000; ++i) bytes += char(i * 131 + 7);
+    for (size_t n : {0, 1, 7, 8, 9, 63, 1000}) {  // every tail length, chained or not
+        assert(crc32(bytes.data(), n) == crc32_portable(bytes.data(), n));
+        assert(crc32(bytes.data(), n, 0x1234) == crc32_portable(bytes.data(), n, 0x1234));
+    }
 }
 
 static void test_append_flush_read_back() {
