@@ -15,9 +15,11 @@
 - **Inputs.** Synthetic workloads use fixed seeds. Real-data numbers use NASDAQ's
   TotalView-ITCH 5.0 sample for 2019-01-30, the first 751 MB (22.4M messages up to 09:38).
   See the README for how to fetch it.
-- **Correctness alongside speed.** `bench_book` prints a checksum over every trade. It has been
-  `2a79b8de12e4cd7d` at every commit since the first baseline, so no optimization changed a
-  single fill.
+- **Correctness alongside speed.** `bench_book` prints a checksum over every trade. On macOS
+  it has been `2a79b8de12e4cd7d` at every commit since the first baseline, so no optimization
+  changed a single fill. The workload comes from `std::uniform_int_distribution`, which
+  libstdc++ implements differently from libc++. On Linux the same code gives a different
+  stream and checksum, `72661ba474b30268`, stable from run to run.
 
 ### Contents
 
@@ -32,6 +34,7 @@
 - [S10: FIX gateway over TCP](#s10-fix-gateway-over-tcp)
 - [S11: journal, recovery, reconciliation](#s11-journal-recovery-reconciliation)
 - [S12: the order book again, at the final commit](#s12-the-order-book-again-at-the-final-commit)
+- [Linux x86 (CI runner)](#linux-x86-ci-runner)
 
 ## Order book workload
 
@@ -456,3 +459,45 @@ venue logic) but left the hot path alone.
 The higher median comes from the machine and its background load, not from code: the ranges
 overlap, and the matching code is the same. The claim that holds is "about 30 M ops/s or
 better, with zero allocations and identical output".
+
+## Linux x86 (CI runner)
+
+The CI `bench` job runs `scripts/bench_linux.sh` on every push, and its output is attached to
+the run. These numbers come from one such run.
+
+- **Machine.** A GitHub-hosted Azure VM: Xeon Platinum 8370C at 2.8 GHz, 4 vCPUs (2 cores
+  with hyperthreading), kernel 7.0, governor `schedutil`, g++ 14.2.
+- **Pinning.** Threads are pinned with `PIN_CPUS=0,1,2,3`, but nothing is isolated, and the
+  VM shares its host. So medians are fair; tails are not.
+- **Clock.** `steady_clock` costs 18 ns here and has nanosecond resolution, so per-operation
+  percentiles mean something, unlike under macOS's 41.67 ns tick.
+
+| bench | Linux x86 | Apple M1 |
+|---|---|---|
+| order book, 5 runs | 30.8 to 31.4 M ops/s | 29.6 M (median, Phase 3) |
+| order book per op | p50 61 ns, p90 91, p99 152, p99.9 430, p99.99 591 | p50 one 42 ns tick |
+| order book hot-path allocations | 0 | 0 |
+| pre-trade risk check | 9.7 ns | 11.2 ns |
+| ITCH parse only | 12 ns/msg | 12 ns/msg |
+| ITCH replay into books | 215 ns/msg | 70 ns/msg |
+| SPSC throughput, 2 pinned threads | 369 M msgs/s | 22 M msgs/s (unpinned) |
+| SPSC round trip p50 / p99.9 | 83 / 111 ns | 215 / 335 ns |
+| mutex round trip p50 / p99.9 | 703 ns / 4.4 µs | 16.4 / 524 µs |
+| async log call vs `fprintf` | 23 vs 134 ns | 34 vs 270 ns |
+| bare TCP loopback round trip p50 | 17.4 µs | 29.7 µs |
+| journal: `write` per record / `fsync` per record | 0.6 µs / 207 µs | 2.5 µs / 4 ms (`F_FULLFSYNC`) |
+
+**What this shows:**
+
+- **The order book and the risk check carry over to x86 almost unchanged.**
+- **Pinning makes the SPSC queue about 17x faster than on the unpinned Mac.** With both
+  threads on fixed cores, the queue's cache lines stay put; the Mac's scheduler moves
+  threads between cores.
+- **Replay into books is 3x slower here than on the M1.** The replay's id tables and
+  ladders are random access, and the M1's memory latency suits that better. I haven't
+  profiled it.
+- **The threaded pipeline is not meaningful on this VM.** Four busy-spinning threads plus
+  the logger share 2 physical cores, so the strategy thread starves, with md-to-strategy
+  hops in the milliseconds. It needs at least 5 real cores to say anything.
+- **The FIX gateway round trip isn't in the script yet.** Only the TCP floor is measured
+  here.

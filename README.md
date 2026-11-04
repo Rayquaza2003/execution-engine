@@ -1,5 +1,7 @@
 # Execution Engine
 
+[![ci](https://github.com/Rayquaza2003/execution-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/Rayquaza2003/execution-engine/actions/workflows/ci.yml)
+
 A trading stack in C++20, from the matching engine up to execution algorithms. The system:
 
 - matches orders;
@@ -69,21 +71,23 @@ The two sides share no memory. They exchange messages only, as a firm and an exc
 
 ## Results
 
-Everything ran on an Apple M1 (8 GB, macOS) with Apple clang `-O3 -march=native`.
+Most numbers come from an Apple M1 (8 GB, macOS, Apple clang `-O3 -march=native`). The
+ones that don't need market data also run on Linux x86 in CI on every push: a shared Azure
+VM, Xeon Platinum 8370C, 4 vCPUs (2 cores), g++ 14, threads pinned but not on isolated cores.
 
-| what | measured | details |
-|---|---|---|
-| order book throughput | about 30 M ops/s (29.6 M median), up from 7.1 M for the `std::map` baseline (4.1x) | [BENCHMARKS](BENCHMARKS.md#phase-3-one-change-at-a-time) |
-| order book allocations | 0 in steady state; every version gives the same trade checksum `2a79b8de12e4cd7d` | |
-| pre-trade risk check | 11 ns per order | [S4](BENCHMARKS.md#s4-pre-trade-risk-check) |
-| ITCH into order books | 70 ns per booked message (14.3 M msgs/s, synthetic feed). A full pass over the real 751 MB day runs at 36.9 M msgs/s, but only 3% of its 22.4M messages belong to the 5 booked symbols, so that figure is mostly parsing. 0 bad references. | [S5](BENCHMARKS.md#s5-market-data-from-itch) |
-| queue position | shortest vs longest fifth of queues fill within 1 s at 0.74 vs 0.46 (SPY); new-level joins lose 0.21 ticks more markout at 100 ms latency than at 0 | [research](research/README.md) |
-| execution algos, 95 paired parents, out of sample | Adaptive beats TWAP by 0.29 bps (95% interval 0.05 to 0.53, errors clustered by start time) | [research](research/README.md#execution-algos-and-tca-s7) |
-| smart order routing, 245 paired parents, out of sample | beats best-price routing by 0.046 bps (0.036 to 0.056), all of it fees on venues I configured, in 1 round instead of 2.2 | [research](research/README.md#smart-order-routing-s8) |
-| SPSC queue vs mutex | round trip p50 215 ns vs 16.4 µs; p99.9 335 ns vs 524 µs | [S9](BENCHMARKS.md#s9-threads-queues-logger) |
-| async logger | 34 ns per call vs 270 ns for `fprintf` | |
-| FIX order round trip over TCP | p50 32 to 35 µs, against a 29.7 µs floor for bare TCP; 134 to 147k requests/s with 64 in flight | [S10](BENCHMARKS.md#s10-fix-gateway-over-tcp) |
-| durability | journal append 59 ns; write-ahead flush adds about 6 µs per reply; recovered 125k orders in about 0.55 s after `kill -9` | [S11](BENCHMARKS.md#s11-journal-recovery-reconciliation) |
+| what | Apple M1 | Linux x86 (CI VM) | details |
+|---|---|---|---|
+| order book throughput | about 30 M ops/s (29.6 M median), up from 7.1 M for the `std::map` baseline (4.1x) | 30.8 to 31.4 M ops/s; per op p50 61 ns, p99 152 ns, p99.99 591 ns | [BENCHMARKS](BENCHMARKS.md#phase-3-one-change-at-a-time), [Linux](BENCHMARKS.md#linux-x86-ci-runner) |
+| order book allocations | 0 in steady state; every optimization kept the trade checksum identical | 0 | |
+| pre-trade risk check | 11 ns per order | 9.7 ns | [S4](BENCHMARKS.md#s4-pre-trade-risk-check) |
+| ITCH into order books | 70 ns per booked message (14.3 M msgs/s, synthetic feed). A full pass over the real 751 MB day runs at 36.9 M msgs/s, but only 3% of its 22.4M messages belong to the 5 booked symbols, so that figure is mostly parsing. 0 bad references. | replay into books 215 ns per message (synthetic) | [S5](BENCHMARKS.md#s5-market-data-from-itch) |
+| queue position | shortest vs longest fifth of queues fill within 1 s at 0.74 vs 0.46 (SPY); new-level joins lose 0.21 ticks more markout at 100 ms latency than at 0 | (needs the ITCH data) | [research](research/README.md) |
+| execution algos, 95 paired parents, out of sample | Adaptive beats TWAP by 0.29 bps (95% interval 0.05 to 0.53, errors clustered by start time) | (needs the ITCH data) | [research](research/README.md#execution-algos-and-tca-s7) |
+| smart order routing, 245 paired parents, out of sample | beats best-price routing by 0.046 bps (0.036 to 0.056), all of it fees on venues I configured, in 1 round instead of 2.2 | (needs the ITCH data) | [research](research/README.md#smart-order-routing-s8) |
+| SPSC queue vs mutex | round trip p50 215 ns vs 16.4 µs; p99.9 335 ns vs 524 µs | pinned: 369 M msgs/s; round trip p50 83 ns vs 703 ns | [S9](BENCHMARKS.md#s9-threads-queues-logger) |
+| async logger | 34 ns per call vs 270 ns for `fprintf` | 23 ns vs 134 ns | |
+| FIX order round trip over TCP | p50 32 to 35 µs, against a 29.7 µs floor for bare TCP; 134 to 147k requests/s with 64 in flight | not run (bare TCP floor 17.4 µs) | [S10](BENCHMARKS.md#s10-fix-gateway-over-tcp) |
+| durability | journal append 59 ns; write-ahead flush adds about 6 µs per reply; recovered 125k orders in about 0.55 s after `kill -9` | `write` per record 0.6 µs; `fsync` per record 207 µs | [S11](BENCHMARKS.md#s11-journal-recovery-reconciliation) |
 
 Some results came out negative, and the notes say so:
 
@@ -95,14 +99,33 @@ Some results came out negative, and the notes say so:
 
 ```sh
 cmake -B build && cmake --build build -j          # Release (-O3 -march=native; asserts stay on in tests)
-ctest --test-dir build                            # 23 test suites
+ctest --test-dir build                            # 27: 24 test suites + 3 fuzz smoke runs
 
 cmake -B build-debug -DCMAKE_BUILD_TYPE=Debug     # AddressSanitizer + UndefinedBehaviorSanitizer
 cmake -B build-tsan -DCMAKE_BUILD_TYPE=Tsan       # ThreadSanitizer
+cmake -B build-fuzz -DFUZZ=ON -DCMAKE_CXX_COMPILER=clang++   # libFuzzer targets
 ```
 
-Every stage passed the release and ASan/UBSan builds with no warnings (`-Wall -Wextra
--Wpedantic`). The TSan build was added in S9, and every stage since has passed it too.
+**CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs on every push:
+
+- **Builds and tests:** Linux with g++ 14 and clang 18, each as Release, ASan+UBSan and
+  TSan, plus macOS. Warnings are errors.
+- **Fuzzing:** each libFuzzer target for 2 minutes under ASan+UBSan.
+- **Benchmarks:** the Linux benchmark script, whose output is attached to every run.
+
+**How correctness is checked, besides unit tests:**
+
+- **Differential test (`tests/test_book_diff.cpp`).** The order book runs against a naive
+  reference book, a vector with linear scans written straight from the rules. That covers
+  400k random operations: limits, markets, IOC, FOK, self-trade prevention, cancels,
+  modifies, reduces and end of day. Results, trades and book state must match after every
+  call. Breaking time priority or FOK's self-trade check in a scratch copy made it fail at
+  once.
+- **Fuzzing (`fuzz/`).** Targets for the FIX codec and session, the ITCH parser plus replay,
+  and journal recovery. They check invariants, not just crashes: framing always makes
+  progress, a book never ends up crossed, and a recovered journal accepts appends.
+- **Platforms.** The same tests run on Linux/libstdc++ and macOS/libc++. That caught a
+  wrong bound in a risk test which only libstdc++'s random stream reached.
 
 ## Run
 
@@ -203,8 +226,17 @@ Deliberate shortcuts are marked in the code with `ponytail:` comments. The main 
   - The resend store lives in memory as well as in the journal.
   - It binds to loopback only, and FIX travels in plaintext with no TLS, so the logon
     password is only as private as the link.
-- **Benchmark platform:** macOS, with no core pinning and a 41.67 ns clock tick. Numbers
-  on Linux with pinned, isolated cores are still to do.
+- **Benchmark platform:**
+  - The M1 numbers come from macOS: no core pinning, and a 41.67 ns clock tick.
+  - The Linux numbers come from a shared 4-vCPU CI VM. Threads are pinned, but the cores
+    aren't isolated and there are only 2 physical cores, so the 4-thread pipeline starves
+    there.
+  - Numbers from a dedicated box with isolated cores are still to do;
+    `scripts/bench_linux.sh` says how to set one up.
+- **Checksum per standard library:** the order-book benchmark draws its workload from
+  `std::uniform_int_distribution`, which libc++ and libstdc++ implement differently. The
+  trade checksum is `2a79b8de12e4cd7d` on macOS (libc++) and `72661ba474b30268` on Linux
+  (libstdc++). Each is stable from run to run.
 - **Data:** one morning of one day; studies need more days before any parameter is fitted.
 
 ## How it was built
