@@ -1,5 +1,7 @@
 // The test bench: open http://127.0.0.1:8080 to trade against the engine.
-// Usage: ./build/web_ui [PORT]   (default 8080; listens on loopback only)
+// Usage: ./build/web_ui [PORT] [--itch FILE SYMBOL...]   (default 8080; loopback only)
+//   --itch: also offer replay mode, rebuilding those symbols' books from a
+//           NASDAQ ITCH 5.0 file (e.g. day.itch AAPL MSFT SPY QQQ TSLA)
 //
 // One thread: a poll() loop over HTTP connections that also runs the
 // background flow between requests. The page (web/index.html, re-read on
@@ -9,12 +11,16 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
+#include <cctype>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <iterator>
 #include <vector>
@@ -55,7 +61,12 @@ static std::string handle(Sandbox& sb, const web::Request& r) {
     else if (r.path == "/api/kill") err = sb.kill(now);
     else if (r.path == "/api/resume") err = sb.resume();
     else if (r.path == "/api/reset") sb.reset();
-    else if (r.path == "/api/flow") sb.set_flow(std::atof(f["rate"].c_str()));
+    else if (r.path == "/api/flow") err = sb.set_flow(std::atof(f["rate"].c_str()));
+    else if (r.path == "/api/mode") err = sb.set_mode(f["mode"] == "replay");
+    else if (r.path == "/api/replay") {
+        if (f.count("speed")) sb.set_speed(std::atof(f["speed"].c_str()));
+        if (f.count("play")) err = sb.play(f["play"] == "1");
+    }
     else if (r.path == "/api/burst") err = sb.burst(std::atoll(f["n"].c_str()), now);
     else return web::response(404, "text/plain", "not found");
     return web::response(err.empty() ? 200 : 400, "application/json",
@@ -65,7 +76,33 @@ static std::string handle(Sandbox& sb, const web::Request& r) {
 int main(int argc, char** argv) {
     std::signal(SIGPIPE, SIG_IGN);
     std::signal(SIGINT, [](int) { g_stop = 1; });
-    uint16_t port = uint16_t(argc > 1 ? std::atoi(argv[1]) : 8080);
+    uint16_t port = 8080;
+    ReplayFeed feed;
+    for (int i = 1; i < argc; ++i) {
+        if (!std::strcmp(argv[i], "--itch") && i + 1 < argc) {
+            int fd = open(argv[++i], O_RDONLY);
+            struct stat st;
+            if (fd < 0 || fstat(fd, &st) != 0) {
+                std::perror(argv[i]);
+                return 1;
+            }
+            void* p = mmap(nullptr, size_t(st.st_size), PROT_READ, MAP_PRIVATE, fd, 0);
+            if (p == MAP_FAILED) {
+                std::perror("mmap");
+                return 1;
+            }
+            feed.data = static_cast<const uint8_t*>(p);
+            feed.bytes = size_t(st.st_size);
+            while (i + 1 < argc && argv[i + 1][0] != '-' && !std::isdigit(static_cast<unsigned char>(argv[i + 1][0])))
+                feed.symbols.push_back(argv[++i]);
+        } else {
+            port = uint16_t(std::atoi(argv[i]));
+        }
+    }
+    if (feed.data && feed.symbols.empty()) {
+        std::fprintf(stderr, "--itch needs symbols after the file, e.g. --itch day.itch AAPL MSFT\n");
+        return 2;
+    }
 
     RiskLimits lim;
     lim.max_order_qty = 10'000;
@@ -74,7 +111,7 @@ int main(int argc, char** argv) {
     lim.max_open_orders = 50;
     lim.collar_bps = 500;                          // 5% from the mid
     lim.max_loss = 50'000.0 * 100;                 // $50k
-    Sandbox sb({"AAPL", "MSFT", "SPY"}, {15'000, 41'000, 50'000}, lim);
+    Sandbox sb({"AAPL", "MSFT", "SPY"}, {15'000, 41'000, 50'000}, lim, feed);
 
     int ls = socket(AF_INET, SOCK_STREAM, 0);
     int one = 1;
@@ -88,7 +125,8 @@ int main(int argc, char** argv) {
         return 1;
     }
     fcntl(ls, F_SETFL, fcntl(ls, F_GETFL) | O_NONBLOCK);
-    std::printf("test bench on http://127.0.0.1:%u  (Ctrl-C to stop)\n", port);
+    std::printf("test bench on http://127.0.0.1:%u  (Ctrl-C to stop)%s\n", port,
+                feed.data ? "; replay mode available" : "");
     std::fflush(stdout);
 
     struct Conn {

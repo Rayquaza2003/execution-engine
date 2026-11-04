@@ -76,7 +76,51 @@ static void test_flow_and_burst() {
     assert(has(sb.state(0, 3), "\"flow\":1000.00"));
 }
 
+// Replay: the books come from an ITCH feed played at a chosen speed. Our
+// order queues behind the real one at the bid, the real one trades first,
+// and we fill when an execution reaches an order queued behind us.
+static void test_replay_mode() {
+    constexpr uint32_t D = 10'000;  // $1 in ITCH units
+    constexpr Nanos kSec = 1'000'000'000;
+    itch::Writer w;
+    w.stock_directory(1, 0, "AAPL");
+    w.add(1, 1 * kSec, 1, Side::Buy, 100, "AAPL", 150 * D);    // before the start: fast-forwarded
+    w.add(1, 1 * kSec, 2, Side::Sell, 100, "AAPL", 150 * D + 100);
+    w.add(1, 15 * kSec, 3, Side::Buy, 300, "AAPL", 150 * D);   // behind us (we join at 12 s)
+    w.execute(1, 20 * kSec, 1, 100, 1);                         // the order ahead of us trades
+    w.execute(1, 25 * kSec, 3, 50, 2);                          // one behind us trades: we fill first
+    ReplayFeed feed{w.buf.data(), w.buf.size(), {"AAPL"}, 10 * kSec};
+    RiskLimits lim;
+    lim.collar_bps = 500;
+    Sandbox sb({"AAPL"}, {15'000}, lim, feed);
+    assert(sb.replay_available() && sb.set_mode(true).empty());
+    std::string s = sb.state(0, 0);
+    assert(has(s, "\"mode\":\"replay\"") && has(s, "\"bid\":150.00") && has(s, "\"clock\":10000"));
+    assert(!sb.set_flow(100).empty() && !sb.burst(10, 0).empty());  // no simulated flow in replay
+
+    sb.set_speed(1);
+    assert(sb.play(true).empty());
+    Nanos wall = 1'000 * kSec;
+    sb.tick(wall);
+    sb.tick(wall += 2 * kSec);  // replay clock 12 s
+    assert(sb.order({{"sym", "AAPL"}, {"side", "buy"}, {"px", "150.00"}, {"qty", "40"}}, wall).empty());
+    s = sb.state(0, wall);
+    assert(has(s, "\"clock\":12000") && has(s, "\"ahead\":100"));
+    sb.tick(wall += 10 * kSec);  // to 22 s: ref 1 traded, still working
+    assert(has(sb.state(0, wall), "\"state\":\"working\""));
+    sb.tick(wall += 5 * kSec);   // to 27 s: ref 3's execution reaches us
+    s = sb.state(0, wall);
+    assert(has(s, "\"state\":\"filled\"") && has(s, "\"position\":40"));
+    sb.tick(wall += 100 * kSec);
+    s = sb.state(0, wall);
+    assert(has(s, "\"end\":true") && has(s, "\"playing\":false") && !sb.play(true).empty());
+    sb.reset();  // back to the start time, everything fresh
+    assert(has(sb.state(0, wall), "\"clock\":10000") && has(sb.state(0, wall), "\"orders\":[]"));
+    assert(sb.set_mode(false).empty() && has(sb.state(0, wall), "\"mode\":\"sim\""));
+}
+
 int main() {
+    test_replay_mode();
     test_http_parsing();
     test_trading_through_the_bench();
     test_flow_and_burst();

@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <ctime>
 #include <deque>
 #include <cstdlib>
 #include <memory>
@@ -13,16 +14,32 @@
 
 #include "core/histogram.hpp"
 #include "exchange/venue.hpp"
+#include "md/replay.hpp"
 #include "oms/oms.hpp"
 #include "risk/risk.hpp"
 #include "web/http.hpp"
 
 // The engine behind the test bench: a venue with one book per symbol, your
-// orders through the OMS and pre-trade risk, a second account that trades
+// orders through the OMS and pre-trade risk, and a second account that trades
 // straight at the venue (to cross against yourself and see self-trade
-// prevention), and a background flow of makers and takers so the books are
-// alive. Every request to the venue is timed. Single-threaded: the HTTP loop
-// calls in, and state() returns a JSON snapshot for the page.
+// prevention). The market around you comes from one of two places:
+//
+//   simulated: a background flow of makers and takers around a drifting mid
+//   replay:    a NASDAQ ITCH file, played back at a chosen speed into the
+//              same books. Your orders rest among the real ones and fill when
+//              real executions reach them in the queue (Venue::replay_execute).
+//
+// Every request to the venue is timed. Single-threaded: the HTTP loop calls
+// in, and state() returns a JSON snapshot for the page.
+
+// An ITCH file already in memory (mmap) and the symbols to rebuild.
+struct ReplayFeed {
+    const uint8_t* data = nullptr;
+    size_t bytes = 0;
+    std::vector<std::string> symbols;
+    Nanos start = 34'200'000'000'000;  // 09:30: everything before is fast-forwarded on reset
+};
+
 class Sandbox {
 public:
     static constexpr AccountId kMe = 1, kMaker = 2, kOther = 3, kTaker = 4;
@@ -30,21 +47,18 @@ public:
 
     using Form = std::unordered_map<std::string, std::string>;
 
-    Sandbox(std::vector<std::string> symbols, std::vector<Price> mids, RiskLimits limits)
-        : names_(std::move(symbols)), start_mids_(std::move(mids)), limits_(limits) {
+    Sandbox(std::vector<std::string> symbols, std::vector<Price> mids, RiskLimits limits, ReplayFeed feed = {})
+        : sim_names_(std::move(symbols)), start_mids_(std::move(mids)), limits_(limits), feed_(std::move(feed)) {
         reset();
     }
 
-    // A fresh session: empty books (then seeded by the flow), no orders, no position.
+    bool replay_available() const { return feed_.data != nullptr; }
+
+    // A fresh session in the current mode: no orders, no position. Simulated
+    // books are seeded by the flow; replayed books are rebuilt from the file
+    // up to its start time (09:30), and playback waits for play().
     void reset() {
         venue_ = std::make_unique<Venue>();
-        risk_ = std::make_unique<Risk>(names_.size(), limits_);
-        oms_ = std::make_unique<Oms>(kMe, kMeBase, risk_.get());
-        bots_.assign(names_.size(), {});
-        for (size_t s = 0; s < names_.size(); ++s) {
-            venue_->add_symbol();
-            bots_[s].mid = start_mids_[s];
-        }
         tape_.clear();
         events_.clear();
         lat_ = Histogram();
@@ -53,8 +67,48 @@ public:
         next_flow_ = 1;
         next_other_ = kOtherBase;
         burst_ = "";
-        for (size_t i = 0; i < 200 * names_.size(); ++i) flow_event(SymbolId(i % names_.size()), true);  // starting liquidity
+        bots_.clear();
+        names_.clear();
+        replay_.reset();
+        if (replay_mode_) {
+            replay_ = std::make_unique<ItchReplay>(*venue_, feed_.symbols);
+            offset_ = 0;
+            clock_ = 0;
+            feed_msgs_ = 0;
+            playing_ = false;
+            at_end_ = false;
+            advance_to(feed_.start, ~size_t(0));  // pre-market, at full speed
+            for (SymbolId i = 0; i < venue_->symbols(); ++i) names_.push_back(replay_->name(i));
+        } else {
+            names_ = sim_names_;
+            bots_.assign(names_.size(), {});
+            for (size_t i = 0; i < names_.size(); ++i) {
+                venue_->add_symbol();
+                bots_[i].mid = start_mids_[i];
+            }
+        }
+        risk_ = std::make_unique<Risk>(std::max<size_t>(names_.size(), 1), limits_);
+        oms_ = std::make_unique<Oms>(kMe, kMeBase, risk_.get());
+        if (!replay_mode_)
+            for (size_t i = 0; i < 200 * names_.size(); ++i) flow_event(SymbolId(i % names_.size()), true);
     }
+
+    // Switch market source; starts a fresh session.
+    std::string set_mode(bool replay) {
+        if (replay && !feed_.data) return "No ITCH file loaded. Start web_ui with --itch FILE SYMBOL...";
+        replay_mode_ = replay;
+        reset();
+        return "";
+    }
+
+    // Replay controls. speed: replayed seconds per real second; 0 = as fast as possible.
+    std::string play(bool on) {
+        if (!replay_mode_) return "Replay is off.";
+        if (on && at_end_) return "The file has no more messages. Reset to start again at 09:30.";
+        playing_ = on;
+        return "";
+    }
+    void set_speed(double x) { speed_ = std::clamp(x, 0.0, 100'000.0); }
 
     // POST /api/order: sym, side (buy|sell), type (limit|market|stop), tif
     // (day|gtc|ioc|fok), px and stop in dollars, qty, who (me|other).
@@ -81,7 +135,7 @@ public:
         const OmsOrder& o =
             oms_->submit({next_cl_++, *s, side, ot, tif, px.value_or(0), Qty(qty), stop.value_or(0)}, reqs).order;
         if (o.state == OrdState::Rejected) {
-            events_.push_front({now / 1'000'000, o.cl, "me", "Rejected", reject_name(o.last_reject), 0, 0, 0});
+            events_.push_front({tod_ms(now), o.cl, "me", "Rejected", reject_name(o.last_reject), 0, 0, 0});
             return std::string("Risk refused it: ") + reject_name(o.last_reject) + ".";
         }
         for (const VenueRequest& rq : reqs) send(rq, now);
@@ -124,10 +178,15 @@ public:
         return "";
     }
 
-    void set_flow(double per_second) { flow_rate_ = std::clamp(per_second, 0.0, 200'000.0); }
+    std::string set_flow(double per_second) {
+        if (replay_mode_) return "No simulated flow during replay: the real market is the flow.";
+        flow_rate_ = std::clamp(per_second, 0.0, 200'000.0);
+        return "";
+    }
 
     // n background orders as fast as the engine takes them.
     std::string burst(long long n, Nanos now) {
+        if (replay_mode_) return "No simulated flow during replay: the real market is the flow.";
         n = std::clamp(n, 1LL, 2'000'000LL);
         auto t0 = std::chrono::steady_clock::now();
         for (long long i = 0; i < n; ++i) flow_event(SymbolId(i % names_.size()), false, now);
@@ -139,11 +198,20 @@ public:
         return "";
     }
 
-    // Background flow for the time since the last call.
+    // The market moves on: replay plays the file forward by elapsed time x
+    // speed; the simulation runs its background flow.
     void tick(Nanos now) {
         if (!last_tick_) last_tick_ = now;
-        double due = flow_rate_ * double(now - last_tick_) / 1e9 + carry_;
+        Nanos dt = now - last_tick_;
         last_tick_ = now;
+        if (replay_mode_) {
+            if (!playing_) return;
+            Nanos target = speed_ > 0 ? clock_ + Nanos(double(dt) * speed_) : ~Nanos(0);
+            advance_to(target, kMaxPerTick);
+            if (at_end_) playing_ = false;
+            return;
+        }
+        double due = flow_rate_ * double(dt) / 1e9 + carry_;
         int n = int(std::min(due, 5000.0));
         carry_ = due - n;
         for (int i = 0; i < n; ++i) flow_event(SymbolId(rng_() % names_.size()), false, now);
@@ -164,8 +232,12 @@ public:
                 (o.side == Side::Buy ? mine_b : mine_s)[o.px] += o.leaves;
         }
         std::optional<Price> bid = b.best_bid(), ask = b.best_ask();
-        Price center = bid && ask ? (*bid + *ask) / 2 : bid ? *bid : ask ? *ask : bots_[focus].mid;
+        Price center = bid && ask ? (*bid + *ask) / 2 : bid ? *bid : ask ? *ask : bots_.empty() ? 0 : bots_[focus].mid;
+        // 29 rows around the mid, wider when the spread is (a few levels past each touch), at most 81.
         Price hi = center + 14, lo = center - 14;
+        if (ask) hi = std::max(hi, *ask + 6);
+        if (bid) lo = std::min(lo, *bid - 6);
+        if (hi - lo > 80) hi = center + 40, lo = center - 40;
         j += ",\"bid\":" + num(bid ? double(*bid) / 100 : NAN) + ",\"ask\":" + num(ask ? double(*ask) / 100 : NAN);
         j += ",\"ladder\":[";
         for (Price p = hi; p >= lo; --p) {
@@ -228,7 +300,13 @@ public:
         j += ",\"stats\":{\"requests\":" + std::to_string(ops_) + ",\"p50\":" + std::to_string(lat_.percentile(0.5)) +
              ",\"p99\":" + std::to_string(lat_.percentile(0.99)) + ",\"p999\":" + std::to_string(lat_.percentile(0.999)) +
              ",\"resting\":" + std::to_string(b.order_count()) + ",\"flow\":" + num(flow_rate_) +
-             ",\"burst\":" + web::quote(burst_) + ",\"now\":" + std::to_string(now / 1'000'000) + "}}";
+             ",\"burst\":" + web::quote(burst_) + ",\"now\":" + std::to_string(tod_ms(now)) + "}";
+        j += ",\"mode\":\"" + std::string(replay_mode_ ? "replay" : "sim") + "\"";
+        j += ",\"replay\":{\"available\":" + std::string(feed_.data ? "true" : "false") +
+             ",\"playing\":" + (playing_ ? "true" : "false") + ",\"end\":" + (at_end_ ? "true" : "false") +
+             ",\"speed\":" + num(speed_) + ",\"clock\":" + std::to_string(clock_ / 1'000'000) +
+             ",\"messages\":" + std::to_string(feed_msgs_) +
+             ",\"progress\":" + num(feed_.bytes ? 100.0 * double(offset_) / double(feed_.bytes) : 0) + "}}";
         return j;
     }
 
@@ -315,17 +393,66 @@ private:
         const OrderBook& b = venue_->book(s);
         if (b.best_bid() && b.best_ask()) risk_->mark(s, (*b.best_bid() + *b.best_ask()) / 2);
         else if (b.best_bid() || b.best_ask()) risk_->mark(s, b.best_bid().value_or(b.best_ask().value_or(0)));
-        else risk_->mark(s, bots_[s].mid);
+        else if (!bots_.empty()) risk_->mark(s, bots_[s].mid);
+        // replay with an empty book: no mark, so risk refuses with "no market price yet"
+    }
+
+    // What the page's clocks show, as ms since midnight: the ITCH clock in
+    // replay (New York time), the local wall clock in the simulation.
+    uint64_t tod_ms(Nanos now) const {
+        if (replay_mode_) return clock_ / 1'000'000;
+        std::time_t t = std::time_t(now / 1'000'000'000);
+        std::tm tm;
+        localtime_r(&t, &tm);
+        return uint64_t((tm.tm_hour * 3600 + tm.tm_min * 60 + tm.tm_sec) * 1000) + now / 1'000'000 % 1000;
+    }
+
+    // Plays the file forward to `target` (ITCH ns since midnight), at most
+    // `max_msgs` messages. Feed orders rest in the same books as ours.
+    void advance_to(Nanos target, size_t max_msgs) {
+        size_t n = 0;
+        Nanos last = clock_;
+        while (offset_ + 2 <= feed_.bytes) {
+            size_t len = itch::be<2>(feed_.data + offset_);
+            if (offset_ + 2 + len > feed_.bytes) break;  // a cut-off last message
+            const uint8_t* m = feed_.data + offset_ + 2;
+            if (len >= 11) {
+                Nanos ts = itch::be<6>(m + 5);
+                if (ts > target) {
+                    clock_ = std::max(clock_, target);
+                    return;
+                }
+                last = std::max(last, ts);
+            }
+            if (n++ == max_msgs) {  // done for this tick
+                clock_ = last;
+                return;
+            }
+            itch::parse(feed_.data + offset_, 2 + len, [&](const auto& msg) { replay_->apply(msg, out_); });
+            offset_ += 2 + len;
+            ++feed_msgs_;
+            if (!out_.prints.empty() || !out_.reports.empty()) route(last);
+            else out_.clear();
+        }
+        at_end_ = true;
+        clock_ = last;
     }
 
     void send(const VenueRequest& rq, Nanos now) {
-        venue_->set_time(now);
+        venue_->set_time(replay_mode_ ? clock_ : now);
         auto t0 = std::chrono::steady_clock::now();
         venue_->on_request(rq, out_);
         lat_.record(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()));
         ++ops_;
+        route(now);
+    }
+
+    // Venue output: prints to the tape, reports to their owner (the OMS for
+    // ours, the event list for the other trader's). Feed orders have no owner.
+    void route(Nanos now) {
+        uint64_t ms = tod_ms(now);
         for (const TradePrint& p : out_.prints) {
-            tape_.push_front({now / 1'000'000, p.sym, p.price, p.qty, p.aggressor == Side::Buy});
+            tape_.push_front({ms, p.sym, p.price, p.qty, p.aggressor == Side::Buy});
             if (tape_.size() > 400) tape_.pop_back();
         }
         for (const ExecReport& r : out_.reports) {
@@ -333,10 +460,10 @@ private:
                 oms_->set_time(now);
                 oms_->on_report(r);
                 if (const OmsOrder* o = oms_->by_id(r.id))
-                    events_.push_front({now / 1'000'000, o->cl, "me", exec_name(r.type), reject_name(r.reason), r.last_px,
-                                        r.last_qty, r.leaves});
-            } else if (r.id >= kOtherBase) {
-                events_.push_front({now / 1'000'000, r.id - kOtherBase + 1, "other", exec_name(r.type), reject_name(r.reason),
+                    events_.push_front({ms, o->cl, "me", exec_name(r.type), reject_name(r.reason), r.last_px, r.last_qty,
+                                        r.leaves});
+            } else if (r.id >= kOtherBase && r.id < ItchReplay::kIdBase) {
+                events_.push_front({ms, r.id - kOtherBase + 1, "other", exec_name(r.type), reject_name(r.reason),
                                     r.last_px, r.last_qty, r.leaves});
             }
             if (events_.size() > 200) events_.pop_back();
@@ -372,9 +499,19 @@ private:
         }
     }
 
-    std::vector<std::string> names_;
+    static constexpr size_t kMaxPerTick = 300'000;  // feed messages per tick at full speed
+
+    std::vector<std::string> sim_names_, names_;  // names_: the session's symbols, by SymbolId
     std::vector<Price> start_mids_;
     RiskLimits limits_;
+    ReplayFeed feed_;
+    bool replay_mode_ = false;
+    std::unique_ptr<ItchReplay> replay_;
+    size_t offset_ = 0;      // next byte of the file
+    Nanos clock_ = 0;        // replay time, ITCH ns since midnight
+    uint64_t feed_msgs_ = 0;
+    bool playing_ = false, at_end_ = false;
+    double speed_ = 1;
     std::unique_ptr<Venue> venue_;
     std::unique_ptr<Risk> risk_;
     std::unique_ptr<Oms> oms_;
