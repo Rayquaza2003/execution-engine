@@ -31,7 +31,8 @@ enum Tag : uint32_t {
     OrdType = 40, OrigClOrdID = 41, PossDupFlag = 43, Price = 44, SenderCompID = 49, SendingTime = 52,
     Side = 54, Symbol = 55, TargetCompID = 56, Text = 58, TimeInForce = 59, CxlRejReason = 102,
     EncryptMethod = 98, HeartBtInt = 108, ResetSeqNumFlag = 141, TestReqID = 112, OrigSendingTime = 122, GapFillFlag = 123,
-    ExecType = 150, LeavesQty = 151, CxlRejResponseTo = 434,
+    ExecType = 150, LeavesQty = 151, CxlRejResponseTo = 434, MassStatusReqID = 584, MassStatusReqType = 585,
+    TotNumReports = 911, LastRptRequested = 912,
 };
 
 inline uint8_t checksum(std::string_view s) {

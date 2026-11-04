@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -19,22 +20,42 @@
 #include "core/spsc.hpp"
 #include "exchange/venue.hpp"
 #include "fix/session.hpp"
+#include "journal/journal.hpp"
 
 // FIX order entry for the venue. One thread runs a poll() loop over the
 // listening socket and every client connection: it frames and sequences FIX
 // (Session), turns NewOrderSingle (D), OrderCancelRequest (F) and
 // OrderCancelReplaceRequest (G) into venue requests, and turns the venue's
 // execution reports back into ExecutionReport (8) and OrderCancelReject (9).
-// The matching engine runs on its own thread behind two SPSC queues, so a
-// slow client never stalls matching.
+// OrderMassStatusRequest (AF) answers with the status of every order the
+// client has. The matching engine runs on its own thread behind two SPSC
+// queues, so a slow client never stalls matching.
+//
+// Sessions belong to a client's CompID, not to a connection: a client that
+// reconnects gets its session back, sequence numbers and all.
+//
+// With a journal, the gateway is recoverable. Every inbound message a session
+// processes and every outbound message it writes are journaled, and the
+// journal is flushed before any byte reaches a socket (write-ahead: no client
+// ever sees an acknowledgement the journal doesn't have). Restarting from the
+// journal restores every session (Session::restore) and replays the inbound
+// application messages through the same code, straight into the matching
+// engine, which rebuilds the books and the order table exactly.
 //
 // Both threads busy-poll: lowest latency, one core each.
 // ponytail: no cancel-on-disconnect: a client's resting orders outlive its
 // connection; add it when a client asks for it.
 class Gateway {
 public:
-    Gateway(std::vector<std::string> symbols, uint16_t port = 0, std::string comp_id = "EXCH")
-        : symbols_(std::move(symbols)), comp_(std::move(comp_id)) {
+    // journal: empty = none. If the file has records, the gateway recovers from them first.
+    Gateway(std::vector<std::string> symbols, uint16_t port = 0, std::string comp_id = "EXCH",
+            std::string journal = "", bool fsync_each_pass = false)
+        : symbols_(std::move(symbols)), comp_(std::move(comp_id)), fsync_(fsync_each_pass) {
+        for (size_t i = 0; i < symbols_.size(); ++i) venue_.add_symbol();
+        if (!journal.empty()) {
+            recover(journal);
+            journal_ = std::make_unique<Journal>(journal);
+        }
         listen_ = socket(AF_INET, SOCK_STREAM, 0);
         int one = 1;
         setsockopt(listen_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
@@ -53,7 +74,7 @@ public:
     }
     ~Gateway() {
         for (auto& c : conns_)
-            if (c && c->fd >= 0) close(c->fd);
+            if (c) close(c->fd);
         close(listen_);
     }
     Gateway(const Gateway&) = delete;
@@ -63,25 +84,28 @@ public:
 
     // Serves until stop is set.
     void run(const std::atomic<bool>& stop) {
-        std::thread matcher([&] { match(stop); });
+        std::atomic<bool> matcher_stop{false};
+        std::thread matcher([&] { match(matcher_stop); });
         std::vector<pollfd> fds;
         char buf[1 << 16];
         Nanos next_timer = 0;
         while (!stop.load(std::memory_order_relaxed)) {
             fds.assign(1, {listen_, POLLIN, 0});
-            for (auto& c : conns_) fds.push_back({c ? c->fd : -1, short(c && !c->s.output().empty() ? POLLIN | POLLOUT : POLLIN), 0});
+            for (auto& c : conns_) {
+                bool out = c && c->client >= 0 && !clients_[size_t(c->client)]->s.output().empty();
+                fds.push_back({c ? c->fd : -1, short(out ? POLLIN | POLLOUT : POLLIN), 0});
+            }
             if (poll(fds.data(), nfds_t(fds.size()), 0) < 0) continue;
             Nanos t = now();
-            if (fds[0].revents & POLLIN) accept_all(t);
+            if (fds[0].revents & POLLIN) accept_all();
             for (size_t i = 1; i < fds.size(); ++i) {
-                Conn* c = conns_[i - 1].get();
-                if (!c || !(fds[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
-                ssize_t n = read(c->fd, buf, sizeof buf);
+                if (!conns_[i - 1] || !(fds[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+                ssize_t n = read(conns_[i - 1]->fd, buf, sizeof buf);
                 if (n <= 0) {
                     if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) drop(i - 1);
                     continue;
                 }
-                c->s.on_bytes(buf, size_t(n), t, [&](const fix::Message& m) { on_app(uint32_t(i - 1), m, t); });
+                on_bytes(i - 1, buf, size_t(n), t);
             }
             // Every request gets an answer from the matcher within a microsecond
             // or so: wait for them here rather than going round poll() again.
@@ -96,17 +120,34 @@ public:
             }
             if (t >= next_timer) {
                 for (size_t i = 0; i < conns_.size(); ++i)
-                    if (conns_[i] && !conns_[i]->s.on_timer(t)) drop(i);
+                    if (Client* c = client_of(i); c && !c->s.on_timer(t)) drop(i);
                 next_timer = t + 100'000'000;
             }
+            persist();  // write-ahead: the journal has it before any client sees it
             for (size_t i = 0; i < conns_.size(); ++i) flush(i);
         }
+        matcher_stop = true;
         matcher.join();
+        if (journal_) journal_->flush();
     }
 
     // Received a new order -> its first execution report written to the socket.
     const Histogram& in_to_out() const { return in_to_out_; }
     uint64_t orders() const { return orders_.size(); }
+    // FNV-1a over every execution report the matching engine produced, in
+    // order: a recovered gateway must arrive at the same value.
+    uint64_t checksum() const { return checksum_; }
+    // FNV-1a over both sides of every book, level by level.
+    uint64_t book_digest() const {
+        uint64_t h = 1469598103934665603ull;
+        for (SymbolId s = 0; s < symbols_.size(); ++s)
+            for (Side side : {Side::Buy, Side::Sell})
+                for (const LevelChange& l : venue_.book(s).top(side, 1 << 20)) {
+                    h = fnv(h, &l.price, sizeof l.price);  // field by field: struct padding is garbage
+                    h = fnv(h, &l.qty, sizeof l.qty);
+                }
+        return h;
+    }
 
     static Nanos now() {
         return Nanos(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -115,13 +156,21 @@ public:
     }
 
 private:
-    struct Conn {
-        int fd;
+    enum Rec : uint16_t { kClient = 1, kIn = 2, kOut = 3 };  // journal record types
+
+    struct Client {
+        std::string comp;
         Session s;
         std::unordered_map<std::string, OrderId> by_cl;  // every ClOrdID this client has used
+        int conn = -1;                                   // connection it is on, if any
+    };
+    struct Conn {
+        int fd;
+        int client = -1;  // unknown until its first message names a CompID
+        std::string pre;  // bytes before that
     };
     struct Ord {
-        uint32_t conn;
+        uint32_t client;
         std::string cl, pending_cl;  // current ClOrdID; the cancel/replace in flight
         SymbolId sym;
         Side side;
@@ -131,6 +180,7 @@ private:
         Qty pending_qty = 0;
         Nanos received = 0;  // until its first report goes out
         bool done = false;   // filled, cancelled, rejected or expired
+        bool rejected = false;
     };
     struct ToVenue {
         VenueRequest rq;
@@ -141,31 +191,110 @@ private:
         bool last;     // the last report for one request
     };
 
+    static uint64_t fnv(uint64_t h, const void* p, size_t n) {
+        auto* b = static_cast<const uint8_t*>(p);
+        for (size_t i = 0; i < n; ++i) h = (h ^ b[i]) * 1099511628211ull;
+        return h;
+    }
     static void nonblocking(int fd) { fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK); }
 
-    void accept_all(Nanos) {
+    void persist() {
+        if (journal_) fsync_ ? journal_->sync() : journal_->flush();
+    }
+
+    Client* client_of(size_t conn) {
+        return conns_[conn] && conns_[conn]->client >= 0 ? clients_[size_t(conns_[conn]->client)].get() : nullptr;
+    }
+
+    uint32_t add_client(const std::string& comp) {
+        uint32_t i = uint32_t(clients_.size());
+        clients_.push_back(std::make_unique<Client>(Client{comp, Session({comp_, comp, 30'000'000'000, false}), {}, -1}));
+        clients_.back()->s.on_record = [this, i](bool out, std::string_view raw) {
+            if (!journal_) return;
+            std::string p(reinterpret_cast<const char*>(&i), sizeof i);
+            p += raw;
+            journal_->append(out ? kOut : kIn, now(), std::string_view(p));
+        };
+        return i;
+    }
+
+    // Journal replay: sessions from their records; books and orders by running
+    // the inbound application messages again, synchronously, with no output.
+    void recover(const std::string& path) {
+        recovering_ = true;
+        fix::Message m;
+        Journal::read(path, [&](uint16_t type, Nanos t, std::string_view p) {
+            if (type == kClient) {
+                add_client(std::string(p));
+                return;
+            }
+            uint32_t ci;
+            std::memcpy(&ci, p.data(), sizeof ci);
+            std::string_view raw = p.substr(sizeof ci);
+            clients_[ci]->s.restore(type == kOut, raw);
+            if (!m.parse(raw)) return;
+            if (type == kIn) on_app(ci, m, t);
+            else exec_id_ = std::max<uint64_t>(exec_id_, uint64_t(m.get_int(fix::ExecID).value_or(0)));  // stay unique
+        });
+        recovering_ = false;
+    }
+
+    void accept_all() {
         for (;;) {
             int fd = accept(listen_, nullptr, nullptr);
             if (fd < 0) return;
             nonblocking(fd);
             int one = 1;
             setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);  // no Nagle: send each message now
-            conns_.push_back(std::make_unique<Conn>(Conn{fd, Session({comp_, "", 30'000'000'000, false}), {}}));
+            conns_.push_back(std::make_unique<Conn>(Conn{fd, -1, {}}));
         }
+    }
+
+    // A connection's bytes. The first message names the client (SenderCompID):
+    // attach its session, new or recovered, then hand everything to it.
+    void on_bytes(size_t ci, const char* p, size_t n, Nanos t) {
+        Conn& c = *conns_[ci];
+        if (c.client < 0) {
+            c.pre.append(p, n);
+            fix::Frame f = fix::frame(c.pre);
+            if (f.status == fix::Frame::More) return;
+            fix::Message m;
+            if (f.status != fix::Frame::Ok || !m.parse(std::string_view(c.pre).substr(0, f.len)) || m.type() != "A")
+                return drop(ci);
+            std::string comp(m.get(fix::SenderCompID).value_or(""));
+            int found = -1;
+            for (size_t i = 0; i < clients_.size(); ++i)
+                if (clients_[i]->comp == comp) found = int(i);
+            if (found >= 0 && clients_[size_t(found)]->conn >= 0) return drop(ci);  // already connected
+            if (found < 0) {
+                found = int(add_client(comp));
+                if (journal_) journal_->append(kClient, t, std::string_view(comp));
+            }
+            Client& cl = *clients_[size_t(found)];
+            cl.s.reconnect();
+            cl.conn = int(ci);
+            c.client = found;
+            std::string bytes;
+            bytes.swap(c.pre);
+            return on_bytes(ci, bytes.data(), bytes.size(), t);
+        }
+        uint32_t who = uint32_t(c.client);
+        clients_[who]->s.on_bytes(p, n, t, [&](const fix::Message& m) { on_app(who, m, t); });
     }
 
     void drop(size_t i) {
         if (!conns_[i]) return;
+        if (Client* c = client_of(i)) c->conn = -1;
         close(conns_[i]->fd);
         conns_[i].reset();
     }
 
     void flush(size_t i) {
-        Conn* c = conns_[i].get();
+        Client* c = client_of(i);
         if (!c) return;
         std::string& out = c->s.output();
         while (!out.empty()) {
-            ssize_t n = write(c->fd, out.data(), out.size());
+            ssize_t n = write(conns_[i]->fd, out.data(), out.size());
             if (n <= 0) {
                 if (errno != EAGAIN && errno != EWOULDBLOCK) return drop(i);
                 return;  // socket full: POLLOUT will bring us back
@@ -175,19 +304,18 @@ private:
         if (c->s.state() == Session::State::LoggedOut) drop(i);
     }
 
-    // Matching thread: requests in, execution reports out; market data isn't published here.
+    // Matching thread: requests in, execution reports out; market data isn't
+    // published here. Drains what is queued before stopping.
     void match(const std::atomic<bool>& stop) {
-        Venue venue;
-        for (size_t i = 0; i < symbols_.size(); ++i) venue.add_symbol();
         VenueOut out;
         ToVenue r;
-        while (!stop.load(std::memory_order_relaxed)) {
+        for (;;) {
             if (!to_venue_.try_pop(r)) {
+                if (stop.load(std::memory_order_relaxed)) return;
                 cpu_relax();
                 continue;
             }
-            venue.set_time(now());
-            venue.on_request(r.rq, out);
+            execute(r.rq, out);
             if (out.reports.empty()) out.reports.push_back({});  // still close the request
             for (size_t i = 0; i < out.reports.size(); ++i) {
                 FromVenue f{out.reports[i], i + 1 < out.reports.size() || out.reports[i].id, i + 1 == out.reports.size()};
@@ -197,21 +325,40 @@ private:
         }
     }
 
+    // The matching engine, from either thread: the matcher when live, the
+    // constructor while recovering (the matcher isn't running then).
+    void execute(const VenueRequest& rq, VenueOut& out) {
+        venue_.on_request(rq, out);
+        for (const ExecReport& e : out.reports) {  // field by field: struct padding is garbage
+            uint64_t f[] = {e.id, e.sym, uint64_t(e.type), uint64_t(e.reason), uint64_t(e.last_px), e.last_qty, e.leaves};
+            checksum_ = fnv(checksum_, f, sizeof f);
+        }
+    }
+
+    void submit(const VenueRequest& rq) {
+        if (recovering_) {  // straight into the book, and straight back
+            execute(rq, recovery_out_);
+            std::vector<ExecReport> reps;
+            reps.swap(recovery_out_.reports);
+            recovery_out_.clear();
+            for (const ExecReport& e : reps) on_report(e, 0);
+            return;
+        }
+        while (!to_venue_.try_push({rq})) cpu_relax();
+        ++inflight_;
+    }
+
     std::optional<SymbolId> symbol(std::string_view name) const {
         for (size_t i = 0; i < symbols_.size(); ++i)
             if (symbols_[i] == name) return SymbolId(i);
         return std::nullopt;
     }
 
-    void submit(const VenueRequest& rq) {
-        while (!to_venue_.try_push({rq})) cpu_relax();
-        ++inflight_;
-    }
-
     void on_app(uint32_t ci, const fix::Message& m, Nanos t) {
-        Conn& c = *conns_[ci];
+        Client& c = *clients_[ci];
         std::string_view type = m.type();
         std::string cl(m.get(fix::ClOrdID).value_or(""));
+        if (type == "AF") return mass_status(c, ci, std::string(m.get(fix::MassStatusReqID).value_or("")), t);
         if (type == "D") {
             std::optional<SymbolId> sym = symbol(m.get(fix::Symbol).value_or(""));
             std::optional<int64_t> qty = m.get_int(fix::OrderQty);
@@ -233,7 +380,7 @@ private:
             else if (tv == "4") tif = Tif::Fok;
             OrderId id = orders_.size() + 1;
             Side s = side == "1" ? Side::Buy : Side::Sell;
-            orders_.push_back({ci, cl, "", *sym, s, Qty(*qty), 0, 0, 0, 0, t});
+            orders_.push_back({ci, cl, "", *sym, s, Qty(*qty), 0, 0, 0, 0, recovering_ ? 0 : t});
             c.by_cl[cl] = id;
             OrdType ot = ord == "1" ? OrdType::Market : OrdType::Limit;
             // Account 0: no self-trade prevention (opt-in per order on real venues; not wired to FIX here).
@@ -262,17 +409,24 @@ private:
         submit(ReplaceRequest{it->second, o.sym, *px, Qty(*qty) - o.cum});  // FIX OrderQty is the total
     }
 
-    void reject_new(Conn& c, const std::string& cl, const char* why, Nanos t) {
-        c.s.send("8", t, [&](fix::Writer& w) {
+    // Sends nothing while recovering: what went out then is already in the
+    // journal and in the session's resend store.
+    template <class F>
+    void send(Client& c, std::string_view type, Nanos t, F&& fill) {
+        if (!recovering_) c.s.send(type, t, fill);
+    }
+
+    void reject_new(Client& c, const std::string& cl, const char* why, Nanos t) {
+        send(c, "8", t, [&](fix::Writer& w) {
             w.field(fix::OrderID, "NONE").field(fix::ClOrdID, cl).field(fix::ExecID, ++exec_id_);
             w.field(fix::ExecType, '8').field(fix::OrdStatus, '8').field(fix::LeavesQty, 0).field(fix::CumQty, 0);
             w.field(fix::AvgPx, 0).field(fix::Text, why);
         });
     }
 
-    void cancel_reject(Conn& c, const std::string& cl, const std::string& orig, bool replace, const char* why,
+    void cancel_reject(Client& c, const std::string& cl, const std::string& orig, bool replace, const char* why,
                        Nanos t, char status = '0') {
-        c.s.send("9", t, [&](fix::Writer& w) {
+        send(c, "9", t, [&](fix::Writer& w) {
             w.field(fix::OrderID, "NONE").field(fix::ClOrdID, cl).field(fix::OrigClOrdID, orig);
             w.field(fix::OrdStatus, status).field(fix::CxlRejResponseTo, replace ? '2' : '1');
             w.field(fix::CxlRejReason, 1).field(fix::Text, why);
@@ -280,21 +434,52 @@ private:
     }
 
     static char status(const Ord& o, Qty leaves) { return !leaves && o.cum ? '2' : o.cum ? '1' : '0'; }
-    // OrdStatus as far as the gateway knows, for a cancel/replace reject.
-    static char status(const Ord& o) { return !o.done ? (o.cum ? '1' : '0') : o.cum >= o.qty ? '2' : '4'; }
+    // OrdStatus as far as the gateway knows, for a cancel/replace reject or a status request.
+    static char status(const Ord& o) {
+        if (!o.done) return o.cum ? '1' : '0';
+        return o.cum >= o.qty ? '2' : o.rejected ? '8' : '4';
+    }
+
+    // One ExecutionReport (ExecType I, order status) per order the client has
+    // ever placed; the last one carries LastRptRequested=Y. No orders: one
+    // report with OrderID NONE, so the client still knows it is complete.
+    void mass_status(Client& c, uint32_t ci, const std::string& req, Nanos t) {
+        std::vector<OrderId> mine;
+        for (OrderId id = 1; id <= orders_.size(); ++id)
+            if (orders_[id - 1].client == ci) mine.push_back(id);
+        if (mine.empty()) {
+            return send(c, "8", t, [&](fix::Writer& w) {
+                w.field(fix::OrderID, "NONE").field(fix::ExecID, ++exec_id_).field(fix::ExecType, 'I');
+                w.field(fix::OrdStatus, '8').field(fix::MassStatusReqID, req).field(fix::TotNumReports, 0);
+                w.field(fix::LastRptRequested, 'Y');
+            });
+        }
+        for (size_t k = 0; k < mine.size(); ++k) {
+            const Ord& o = orders_[mine[k] - 1];
+            send(c, "8", t, [&](fix::Writer& w) {
+                w.field(fix::OrderID, mine[k]).field(fix::ClOrdID, o.cl).field(fix::ExecID, ++exec_id_);
+                w.field(fix::ExecType, 'I').field(fix::OrdStatus, status(o)).field(fix::Symbol, symbols_[o.sym]);
+                w.field(fix::Side, o.side == Side::Buy ? '1' : '2').field(fix::OrderQty, o.qty);
+                w.field(fix::LeavesQty, o.done ? 0 : o.qty - o.cum).field(fix::CumQty, o.cum);
+                w.price(fix::AvgPx, o.cum ? Price(o.notional / double(o.cum) + 0.5) : 0);
+                w.field(fix::MassStatusReqID, req).field(fix::TotNumReports, mine.size());
+                if (k + 1 == mine.size()) w.field(fix::LastRptRequested, 'Y');
+            });
+        }
+    }
 
     void on_report(const ExecReport& r, Nanos t) {
         Ord& o = orders_[r.id - 1];
-        Conn* c = conns_[o.conn].get();
         if (r.type == ExecType::Trade) {
             o.cum += r.last_qty;
             o.notional += double(r.last_px) * double(r.last_qty);
         }
         o.done |= (r.type == ExecType::Trade && !r.leaves) || r.type == ExecType::Cancelled ||
                   r.type == ExecType::Rejected || r.type == ExecType::Expired;
-        if (!c) return;  // the client is gone; its order still trades
+        o.rejected |= r.type == ExecType::Rejected;
+        Client& c = *clients_[o.client];
         if (r.type == ExecType::CancelRejected || r.type == ExecType::ReplaceRejected) {
-            cancel_reject(*c, o.pending_cl, o.cl, r.type == ExecType::ReplaceRejected,
+            cancel_reject(c, o.pending_cl, o.cl, r.type == ExecType::ReplaceRejected,
                           o.done ? "order already done" : "rejected by venue", t, status(o));
             o.pending_cl.clear();
             return;
@@ -317,7 +502,9 @@ private:
         Qty leaves = r.type == ExecType::Trade || r.type == ExecType::New || r.type == ExecType::Replaced ? r.leaves : 0;
         ord = exec == '4' ? '4' : exec == '8' ? '8' : exec == 'C' ? 'C' : status(o, leaves);
         const std::string& name = symbols_[o.sym];
-        c->s.send("8", t, [&](fix::Writer& w) {
+        // A client that is away still gets the report: it waits in the session
+        // (and the journal) for a resend after it logs back on.
+        send(c, "8", t, [&](fix::Writer& w) {
             w.field(fix::OrderID, r.id).field(fix::ClOrdID, o.cl);
             if (!orig.empty()) w.field(fix::OrigClOrdID, orig);
             w.field(fix::ExecID, ++exec_id_).field(fix::ExecType, exec).field(fix::OrdStatus, ord);
@@ -327,21 +514,29 @@ private:
             if (exec == 'F') w.price(fix::LastPx, r.last_px).field(fix::LastQty, r.last_qty);
             if (exec == '8') w.field(fix::Text, "rejected by venue");
         });
-        if (o.received) {
-            flush(o.conn);
+        if (o.received && c.conn >= 0) {
+            persist();  // write-ahead, even on this fast path
+            flush(size_t(c.conn));
             in_to_out_.record(now() - o.received);
-            o.received = 0;
         }
+        o.received = 0;
     }
 
     std::vector<std::string> symbols_;
     std::string comp_;
+    bool fsync_;
     int listen_ = -1;
     uint16_t port_ = 0;
-    std::vector<std::unique_ptr<Conn>> conns_;  // by connection number; null once closed
-    std::vector<Ord> orders_;                   // by OrderId - 1
+    Venue venue_;                                   // the matcher's once run() starts
+    std::vector<std::unique_ptr<Client>> clients_;  // by first logon
+    std::vector<std::unique_ptr<Conn>> conns_;      // by connection number; null once closed
+    std::vector<Ord> orders_;                       // by OrderId - 1
     uint64_t exec_id_ = 0;
+    uint64_t checksum_ = 1469598103934665603ull;  // written by the matcher; read after run()
     size_t inflight_ = 0;  // requests sent to the matcher, not yet fully answered
+    std::unique_ptr<Journal> journal_;
+    bool recovering_ = false;
+    VenueOut recovery_out_;
     Spsc<ToVenue, 1 << 16> to_venue_;
     Spsc<FromVenue, 1 << 16> from_venue_;
     Histogram in_to_out_;

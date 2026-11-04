@@ -6,16 +6,25 @@
 #include <thread>
 
 #include "net/gateway.hpp"
+#include "oms/oms.hpp"
 
 using Fields = std::map<uint32_t, std::string>;
 
 // A blocking test client: real socket, real Session.
 struct Client {
-    int fd;
+    int fd = -1;
     Session s;
     std::vector<Fields> got;  // application messages received, in order
 
-    Client(uint16_t port, const char* name) : s({name, "EXCH", 30'000'000'000, true}) {
+    Client(uint16_t port, const char* name) : s({name, "EXCH", 30'000'000'000, true}) { connect_to(port, false); }
+    ~Client() { drop(); }
+    void drop() {  // the connection dies; the session stays
+        if (fd >= 0) close(fd);
+        fd = -1;
+    }
+
+    // (Re)connect and log on; the session keeps its sequence numbers unless reset.
+    void connect_to(uint16_t port, bool reset) {
         fd = socket(AF_INET, SOCK_STREAM, 0);
         sockaddr_in a{};
         a.sin_family = AF_INET;
@@ -26,10 +35,30 @@ struct Client {
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
         timeval tv{0, 20'000};
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-        s.logon(Gateway::now());
+        s.logon(Gateway::now(), reset);
         assert(wait([&] { return s.state() == Session::State::Active; }));
     }
-    ~Client() { close(fd); }
+    void reconnect(uint16_t port, bool reset) {
+        drop();
+        s.reconnect();
+        connect_to(port, reset);
+    }
+    // OrderMassStatusRequest: every order's status, until LastRptRequested=Y.
+    std::vector<Fields> mass_status(const char* id) {
+        s.send("AF", Gateway::now(), [&](fix::Writer& w) {
+            w.field(fix::MassStatusReqID, id).field(fix::MassStatusReqType, 7);
+        });
+        assert(wait([&] {
+            for (const Fields& f : got)
+                if (f.count(fix::LastRptRequested)) return true;
+            return false;
+        }));
+        std::vector<Fields> v;
+        for (const Fields& f : got)
+            if (f.count(fix::MassStatusReqID) && f.at(fix::MassStatusReqID) == id) v.push_back(f);
+        got.clear();
+        return v;
+    }
 
     // Sends what the session has queued, then reads until done() or 2 s pass.
     template <class P>
@@ -48,7 +77,7 @@ struct Client {
                 s.on_bytes(buf, size_t(n), Gateway::now(), [&](const fix::Message& m) {
                     Fields f;
                     f[fix::MsgType] = std::string(m.type());
-                    for (uint32_t t : {11u, 14u, 17u, 31u, 32u, 37u, 39u, 41u, 58u, 150u, 151u, 434u})
+                    for (uint32_t t : {6u, 11u, 14u, 17u, 31u, 32u, 37u, 39u, 41u, 58u, 150u, 151u, 434u, 584u, 911u, 912u})
                         if (auto v = m.get(t)) f[t] = std::string(*v);
                     got.push_back(f);
                 });
@@ -133,7 +162,114 @@ static void test_orders_over_tcp() {
     assert(gw.orders() == 2 && gw.in_to_out().count() == 2);
 }
 
+static std::string temp_journal() {
+    char p[] = "/tmp/gateway_journal_XXXXXX";
+    close(mkstemp(p));
+    unlink(p);
+    return p;
+}
+
+// The gateway dies with orders resting. A new one comes back from the
+// journal: same books, same matching-engine output checksum, same orders and
+// ClOrdIDs, same FIX sequence numbers, and a torn record at the end of the
+// journal is ignored. The buyer reconnects without a reset and carries on.
+static void test_crash_and_recover_from_journal() {
+    std::string path = temp_journal();
+    uint64_t sum, digest, last_exec;
+    std::unique_ptr<Client> buyer;
+    {
+        Gateway gw({"AAPL"}, 0, "EXCH", path);
+        std::atomic<bool> stop{false};
+        std::thread server([&] { gw.run(stop); });
+        buyer = std::make_unique<Client>(gw.port(), "BUYER");
+        Client seller(gw.port(), "SELLER");
+        buyer->order("b1", '1', "100", "10.00");
+        buyer->expect("b1");
+        seller.order("s1", '2', "60", "10.00");
+        seller.expect("s1");
+        seller.expect("s1");
+        buyer->expect("b1");
+        buyer->order("b2", '1', "50", "9.99");
+        last_exec = std::stoull(buyer->expect("b2")[fix::ExecID]);
+        stop = true;
+        server.join();
+        sum = gw.checksum();
+        digest = gw.book_digest();
+    }  // gone: sockets closed, nothing logged out
+    FILE* f = std::fopen(path.c_str(), "ab");
+    std::fwrite("\x40\x00\x00\x00\x02", 1, 5, f);  // a record cut short mid-write
+    std::fclose(f);
+
+    Gateway gw({"AAPL"}, 0, "EXCH", path);
+    assert(gw.checksum() == sum && gw.book_digest() == digest && gw.orders() == 3);
+    std::atomic<bool> stop{false};
+    std::thread server([&] { gw.run(stop); });
+    buyer->reconnect(gw.port(), false);  // sequence numbers carry on: no "too low", no reset
+    assert(buyer->s.gaps() == 0);
+
+    buyer->cancel("b3", "b1");  // the order and its ClOrdID survived
+    Fields c = buyer->expect("b3");
+    assert(c[fix::ExecType] == "4" && c[fix::CumQty] == "60" && std::stoull(c[fix::ExecID]) > last_exec);
+    buyer->order("b2", '1', "10", "9.99");
+    assert(buyer->expect("b2")[fix::Text] == "duplicate ClOrdID");
+
+    std::vector<Fields> st = buyer->mass_status("m1");
+    assert(st.size() == 2 && st[0][fix::ClOrdID] == "b3" && st[0][fix::OrdStatus] == "4" && st[0][fix::CumQty] == "60");
+    assert(st[1][fix::ClOrdID] == "b2" && st[1][fix::OrdStatus] == "0" && st[1][fix::LeavesQty] == "50");
+    assert(st[1][fix::TotNumReports] == "2" && st[1][fix::LastRptRequested] == "Y" && !st[0].count(fix::LastRptRequested));
+    buyer.reset();
+    stop = true;
+    server.join();
+    unlink(path.c_str());
+}
+
+// The seller's OMS loses its connection with two orders resting; both trade
+// while it is away. It comes back with a sequence reset, so those execution
+// reports are gone for good, and rebuilds the truth from a mass status request.
+static void test_oms_reconciles_after_reset() {
+    Gateway gw({"AAPL"});
+    std::atomic<bool> stop{false};
+    std::thread server([&] { gw.run(stop); });
+    Risk risk(1, RiskLimits{});
+    risk.mark(0, 1000);
+    Oms oms(1, 1000, &risk);
+    Client seller(gw.port(), "SELLER"), buyer(gw.port(), "BUYER");
+    std::vector<VenueRequest> reqs;
+    for (ClOrdId cl : {1, 2}) {
+        Price px = cl == 1 ? 1000 : 1001;
+        oms.submit({cl, 0, Side::Sell, OrdType::Limit, Tif::Day, px, 100}, reqs);
+        seller.s.send("D", Gateway::now(), [&](fix::Writer& w) {
+            w.field(fix::ClOrdID, cl).field(fix::Symbol, "AAPL").field(fix::Side, '2').field(fix::OrderQty, 100);
+            w.field(fix::OrdType, '2').price(fix::Price, px);
+        });
+        assert(seller.expect(std::to_string(cl))[fix::ExecType] == "0");
+        oms.on_report({oms.find(cl)->id, 0, ExecType::New, Reject::None, 0, 0, 100});
+    }
+    seller.drop();  // connection lost
+    buyer.order("x", '1', "150", "10.01");  // takes 100 at 10.00 and 50 at 10.01
+    buyer.expect("x");
+    seller.reconnect(gw.port(), true);
+    assert(seller.s.next_in() == 2);  // the fills sent while away are not coming
+
+    std::vector<Oms::VenueStatus> venue;
+    for (Fields& f : seller.mass_status("r1")) {
+        char st = f[fix::OrdStatus][0];
+        OrdState s = st == '1' ? OrdState::PartiallyFilled : st == '2' ? OrdState::Filled : st == '4' ? OrdState::Cancelled
+                     : st == '8' ? OrdState::Rejected : OrdState::Acknowledged;
+        venue.push_back({std::stoull(f[fix::ClOrdID]), s, std::stoull(f[fix::CumQty]),
+                         double(*fix::to_price(f[fix::AvgPx])), std::stoull(f[fix::LeavesQty])});
+    }
+    assert(oms.reconcile(venue) == 2);
+    assert(oms.find(1)->state == OrdState::Filled && oms.find(1)->cum == 100 && oms.find(1)->avg_px() == 1000);
+    assert(oms.find(2)->state == OrdState::PartiallyFilled && oms.find(2)->cum == 50 && oms.find(2)->leaves == 50);
+    assert(risk.position(0) == -150 && risk.open_qty(0, Side::Sell) == 50);
+    stop = true;
+    server.join();
+}
+
 int main() {
+    test_crash_and_recover_from_journal();
+    test_oms_reconciles_after_reset();
     test_orders_over_tcp();
     std::puts("all tests passed");
 }
