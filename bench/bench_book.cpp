@@ -12,9 +12,11 @@
 using Clock = std::chrono::steady_clock;
 
 // Counts every heap allocation in the process, so the bench can prove the
-// steady-state hot path allocates nothing.
+// steady-state hot path allocates nothing. Kept out of line: if GCC inlines it,
+// it sees malloc behind every container growth and its object-size analysis
+// raises false -Wstringop-overflow warnings inside the order book.
 static size_t g_allocs = 0;
-void* operator new(size_t n) {
+[[gnu::noinline]] void* operator new(size_t n) {
     ++g_allocs;
     if (void* p = std::malloc(n ? n : 1)) return p;
     throw std::bad_alloc();
