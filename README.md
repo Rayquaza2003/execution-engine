@@ -99,7 +99,7 @@ Some results came out negative, and the notes say so:
 
 ```sh
 cmake -B build && cmake --build build -j          # Release (-O3 -march=native; asserts stay on in tests)
-ctest --test-dir build                            # 27: 24 test suites + 3 fuzz smoke runs
+ctest --test-dir build                            # 28: 25 test suites + 3 fuzz smoke runs
 
 cmake -B build-debug -DCMAKE_BUILD_TYPE=Debug     # AddressSanitizer + UndefinedBehaviorSanitizer
 cmake -B build-tsan -DCMAKE_BUILD_TYPE=Tsan       # ThreadSanitizer
@@ -128,6 +128,30 @@ cmake -B build-fuzz -DFUZZ=ON -DCMAKE_CXX_COMPILER=clang++   # libFuzzer targets
   wrong bound in a risk test which only libstdc++'s random stream reached.
 
 ## Run
+
+### Test bench in the browser
+
+```sh
+./build/web_ui            # then open http://127.0.0.1:8080
+```
+
+This is a trading screen over the live engine: a venue with AAPL, MSFT and SPY books, your
+orders through the OMS and risk checks, and a background flow of makers and takers.
+
+- **Trading:** click the depth ladder to buy or sell at a price, or use the ticket for market,
+  stop-limit, IOC and FOK orders. Your resting orders show in the ladder, and the blotter
+  shows how many shares are queued ahead of each one.
+- **Testing the engine:**
+  - Trade as a second account to cross against yourself.
+  - Push an order past a risk limit to see it refused.
+  - Hit the kill switch.
+  - Run a 200k-order burst to see throughput, with the engine's time per request (p50,
+    p99, p99.9) live in the header.
+
+The page is plain HTML and JavaScript (`web/index.html`). The server is one thread on POSIX
+sockets, listening on loopback only (`tools/web_ui.cpp`, `src/web/`).
+
+### Benchmarks
 
 Benchmarks that need no data:
 
