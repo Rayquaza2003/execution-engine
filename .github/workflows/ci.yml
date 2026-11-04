@@ -1,0 +1,68 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} ${{ matrix.cxx }} ${{ matrix.type }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, cxx: g++-14, type: Release }
+          - { os: ubuntu-24.04, cxx: g++-14, type: Debug }      # ASan + UBSan
+          - { os: ubuntu-24.04, cxx: g++-14, type: Tsan }
+          - { os: ubuntu-24.04, cxx: clang++-18, type: Release }
+          - { os: ubuntu-24.04, cxx: clang++-18, type: Debug }
+          - { os: ubuntu-24.04, cxx: clang++-18, type: Tsan }
+          - { os: macos-14, cxx: clang++, type: Release }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Let TSan map its shadow memory (24.04 kernels randomize more address bits than it supports)
+        if: matrix.type == 'Tsan' && runner.os == 'Linux'
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: Configure (warnings are errors)
+        run: cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.type }} -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+      - name: Build
+        run: cmake --build build -j4
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  fuzz:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get install -y -qq libclang-rt-18-dev
+      - name: Build libFuzzer targets (ASan + UBSan)
+        run: |
+          cmake -B build-fuzz -DFUZZ=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=clang++-18
+          cmake --build build-fuzz -j4 --target fuzz_fix fuzz_itch fuzz_journal
+      - name: Fuzz each target for 2 minutes
+        run: |
+          for f in fix itch journal; do
+            mkdir -p corpus/$f && cp fuzz/corpus/$f/* corpus/$f/
+            ./build-fuzz/fuzz_$f -max_total_time=120 -rss_limit_mb=4096 -print_final_stats=1 corpus/$f 2>&1 | tail -15
+          done
+      - name: Keep crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: crash-*
+
+  bench:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-14 && cmake --build build -j4
+      - name: Benchmarks (shared VM, so pinned but not isolated)
+        run: CXX=g++-14 PIN_CPUS=0,1,2,3 scripts/bench_linux.sh build | tee bench-linux.txt
+      - run: echo '```' >> $GITHUB_STEP_SUMMARY && cat bench-linux.txt >> $GITHUB_STEP_SUMMARY && echo '```' >> $GITHUB_STEP_SUMMARY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-linux
+          path: bench-linux.txt
